@@ -165,4 +165,5 @@ so anything built on this package can test without a socket.
 
 ## License
 
-MIT.
+Apache-2.0, the same licence as [Rostam](https://github.com/rostamlabs/rostam)
+itself — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
