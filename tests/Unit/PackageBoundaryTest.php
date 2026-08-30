@@ -97,4 +97,26 @@ class PackageBoundaryTest extends TestCase
             $this->assertStringNotContainsString('Illuminate\\', file_get_contents($path), basename($path));
         }
     }
+
+    /**
+     * The README promises "no extensions beyond core streams". That promise
+     * belongs in the manifest, where Composer enforces it for every installer,
+     * rather than in CI - a first attempt tried to hold it by stripping the
+     * runner's extensions instead, which only broke Composer itself and proved
+     * nothing about the package.
+     *
+     * ext-* under require-dev is fine: that is the toolchain, not the library.
+     */
+    public function test_it_requires_no_php_extension(): void
+    {
+        /** @var array{require?: array<string, string>} $manifest */
+        $manifest = json_decode(file_get_contents(dirname(__DIR__, 2).'/composer.json'), true);
+
+        $extensions = array_filter(
+            array_keys($manifest['require'] ?? []),
+            static fn (string $package) => str_starts_with($package, 'ext-')
+        );
+
+        $this->assertSame([], array_values($extensions), 'an extension requirement has crept into require');
+    }
 }

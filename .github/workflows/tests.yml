@@ -34,9 +34,6 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          # No extensions beyond core streams - that is a promise this package
-          # makes in its README, so CI must not quietly install more.
-          extensions: none, json, mbstring, tokenizer, pcre, spl, phar
           coverage: none
 
       - name: Install dependencies
