@@ -8,7 +8,7 @@ Rostam's KV half is **not on its REST API**. It lives only on the binary TCP
 protocol, because it is built for sub-microsecond operations that an HTTP round
 trip would defeat. This package is that protocol, and nothing else — no framework,
 no container, no cache semantics. If you want a Laravel cache driver, that is
-[`rostamlabs/laravel-rostam-cache`](https://github.com/rostamlabs/laravel-rostam-cache),
+[`rostamlabs/rostam-cache-laravel`](https://github.com/rostamlabs/rostam-cache-laravel),
 which is built on this.
 
 ## Requirements
