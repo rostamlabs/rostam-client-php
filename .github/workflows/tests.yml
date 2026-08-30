@@ -13,6 +13,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  style:
+    name: formatting
+    runs-on: ubuntu-latest
+
+    # Once, not per matrix entry. Formatting is one convention for the
+    # repository, and Pint's own rules move between releases - asking the OLDEST
+    # allowed Pint to agree with the newest about the same file is a question
+    # with no answer, not a finding.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Install dependencies
+        uses: ramsey/composer-install@v3
+
+      - run: vendor/bin/pint --test
+
   test:
     name: PHP ${{ matrix.php }} ${{ matrix.dependencies }}
     runs-on: ubuntu-latest
@@ -40,9 +61,6 @@ jobs:
         uses: ramsey/composer-install@v3
         with:
           dependency-versions: ${{ matrix.dependencies }}
-
-      - name: Check formatting
-        run: vendor/bin/pint --test
 
       - name: Run the suite
         run: vendor/bin/phpunit
