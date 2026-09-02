@@ -5,11 +5,13 @@ declare(strict_types=1);
 
 namespace Rostam\Tests\Feature;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Rostam\Exceptions\ConnectionException;
 use Rostam\Exceptions\ServerException;
 use Rostam\Kv\Protocol\Connection;
 use Rostam\Kv\Protocol\ConnectionConfig;
+use Rostam\Kv\Protocol\Response;
 use Rostam\Kv\Protocol\Status;
 use Rostam\Kv\Protocol\Wire;
 use Rostam\Kv\TcpClient;
@@ -361,32 +363,83 @@ class TcpClientTest extends TestCase
     }
 
     /**
-     * A frame this client would never send, answered the way rostam answers it.
-     *
-     * The docblock on the stub promises that anything it cannot carry out comes
-     * back as a bare `internal error` - args it could not decode included. The
-     * stub did not honour that: a short payload reached `unpack` and raised,
-     * killing the server process rather than answering. Asserted in both modes,
-     * so the promise is the real server's and not the fake's.
+     * @return list<array{string, string}>
      */
-    public function test_undecodable_args_are_answered_not_crashed_on(): void
+    public static function malformedArgs(): array
+    {
+        // Written with pack() rather than a double-quoted byte escape:
+        // these are declared LENGTHS, which pack says out loud, and an escape
+        // written the other way gets folded into raw bytes by the formatter,
+        // which turns this file binary and its diff unreadable in review.
+        return [
+            'put: key declares five bytes, carries two' => [Wire::OP_PUT, pack('n', 5).'ab'],
+            'get: key declares five bytes, carries two' => [Wire::OP_GET, pack('n', 5).'ab'],
+            'cas: value declares nine bytes, carries two' => [Wire::OP_CAS, pack('n', 2).'ab'.pack('N', 9).'xy'],
+            // These two decode their args inline rather than through the shared
+            // helpers, which is exactly how the same mistake survives a fix.
+            'expire: key declares five bytes, carries two' => [Wire::OP_EXPIRE, pack('n', 5).'ab'],
+            'incr_ex: key declares five bytes, carries two' => [Wire::OP_INCR_EX, pack('n', 5).'ab'],
+        ];
+    }
+
+    /**
+     * Frames this client would never send, answered the way rostam answers them.
+     *
+     * Two ways to get this wrong, and the stub had both. A short VALUE reached
+     * `unpack` and raised, killing the server process. A short KEY did not even
+     * raise - `substr` shortens in silence - so a truncated `get` came back as
+     * an ordinary miss on a shorter key, which is a wrong answer rather than a
+     * loud one. A real v0.6.0 answers `internal error` to all three, so these
+     * run in both modes and the promise is the server's, not the fake's.
+     */
+    #[DataProvider('malformedArgs')]
+    public function test_undecodable_args_are_answered_not_crashed_on(string $op, string $args): void
     {
         $client = $this->client();
 
-        $connection = new Connection(ConnectionConfig::fromArray($this->server->connectionConfig()));
-        $connection->open();
-
-        // A key length of five, and two bytes of key.
-        $connection->write(Wire::frame(Wire::OP_PUT, ' ab'));
-        $response = $connection->readResponse();
+        $response = $this->sendRaw(Wire::frame($op, $args));
 
         $this->assertSame(Status::ERROR, $response->status);
         $this->assertStringContainsString('internal error', $response->payload);
 
-        $connection->close();
-
         // ...and the server is still there to serve the next test.
         $this->assertTrue($client->ping());
+    }
+
+    /**
+     * The one malformed request rostam names, and it is named a layer lower.
+     *
+     * A body whose own header points past the end of what arrived never reaches
+     * an op at all, so it is not "something the server could not carry out" and
+     * does not get the generic answer. Measured on v0.6.0: `server: frame
+     * truncated`. The stub decoded the body outside its guard and died here.
+     */
+    public function test_a_frame_that_points_past_its_own_end_is_named(): void
+    {
+        $client = $this->client();
+
+        // op length 3, "put", and one byte where a four-byte args length goes.
+        $body = chr(3).'put'.chr(1);
+        $response = $this->sendRaw(pack('N', strlen($body)).$body);
+
+        $this->assertSame(Status::ERROR, $response->status);
+        $this->assertStringContainsString('frame truncated', $response->payload);
+
+        $this->assertTrue($client->ping());
+    }
+
+    /** Write bytes this client's own encoders would never produce. */
+    private function sendRaw(string $frame): Response
+    {
+        $connection = new Connection(ConnectionConfig::fromArray($this->server->connectionConfig()));
+        $connection->open();
+        $connection->write($frame);
+
+        try {
+            return $connection->readResponse();
+        } finally {
+            $connection->close();
+        }
     }
 
     /**
