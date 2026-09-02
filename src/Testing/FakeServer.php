@@ -41,9 +41,6 @@ final class FakeServer
     }
 
     /**
-     * Is the suite pointed at a real server rather than this fake?
-     */
-    /**
      * Whether this server may be destroyed by the test using it.
      *
      * A fake is a fresh process per test and always is. A real one named by
@@ -52,12 +49,21 @@ final class FakeServer
      * there with it. Nothing on the wire says whether that server is a scratch
      * one, so the operator declares it and destructive tests skip until they
      * do. The conformance CI job starts its own server and sets the flag.
+     *
+     * Only an affirmative value counts. Reading "any value at all" would have
+     * let somebody who wrote `=0` to mean no lose their keyspace, and this flag
+     * exists for exactly that person; anything unrecognised skips the tests,
+     * which costs a little coverage and nothing else.
      */
     public static function isDisposable(): bool
     {
-        return ! self::isExternal() || (string) getenv('ROSTAM_TEST_SERVER_IS_DISPOSABLE') !== '';
+        return ! self::isExternal()
+            || filter_var((string) getenv('ROSTAM_TEST_SERVER_IS_DISPOSABLE'), FILTER_VALIDATE_BOOL);
     }
 
+    /**
+     * Is the suite pointed at a real server rather than this fake?
+     */
     public static function isExternal(): bool
     {
         $target = getenv('ROSTAM_TEST_SERVER');

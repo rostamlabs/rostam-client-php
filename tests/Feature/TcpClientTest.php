@@ -8,7 +8,10 @@ namespace Rostam\Tests\Feature;
 use PHPUnit\Framework\TestCase;
 use Rostam\Exceptions\ConnectionException;
 use Rostam\Exceptions\ServerException;
+use Rostam\Kv\Protocol\Connection;
+use Rostam\Kv\Protocol\ConnectionConfig;
 use Rostam\Kv\Protocol\Status;
+use Rostam\Kv\Protocol\Wire;
 use Rostam\Kv\TcpClient;
 use Rostam\Testing\FakeServer;
 use Rostam\TimeUnit;
@@ -355,6 +358,35 @@ class TcpClientTest extends TestCase
             $this->assertSame('set_nx', $exception->op);
             $this->assertStringContainsString('internal error', $exception->getMessage());
         }
+    }
+
+    /**
+     * A frame this client would never send, answered the way rostam answers it.
+     *
+     * The docblock on the stub promises that anything it cannot carry out comes
+     * back as a bare `internal error` - args it could not decode included. The
+     * stub did not honour that: a short payload reached `unpack` and raised,
+     * killing the server process rather than answering. Asserted in both modes,
+     * so the promise is the real server's and not the fake's.
+     */
+    public function test_undecodable_args_are_answered_not_crashed_on(): void
+    {
+        $client = $this->client();
+
+        $connection = new Connection(ConnectionConfig::fromArray($this->server->connectionConfig()));
+        $connection->open();
+
+        // A key length of five, and two bytes of key.
+        $connection->write(Wire::frame(Wire::OP_PUT, ' ab'));
+        $response = $connection->readResponse();
+
+        $this->assertSame(Status::ERROR, $response->status);
+        $this->assertStringContainsString('internal error', $response->payload);
+
+        $connection->close();
+
+        // ...and the server is still there to serve the next test.
+        $this->assertTrue($client->ping());
     }
 
     /**

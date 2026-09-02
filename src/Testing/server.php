@@ -151,6 +151,22 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
         return frame(3, GENERIC_ERROR);
     }
 
+    // Args this fake cannot decode reach `unpack` short and raise. rostam does
+    // not get to crash on a malformed request and neither does its stand-in:
+    // it answers the same thing it answers for everything else it cannot carry
+    // out, which is what the docblock above promises.
+    try {
+        return dispatch($op, $args, $store);
+    } catch (Throwable) {
+        return frame(3, GENERIC_ERROR);
+    }
+}
+
+/**
+ * @param  array<string, array{value: string, expires: float|null}>  $store
+ */
+function dispatch(string $op, string $args, array &$store): string
+{
     switch ($op) {
         case '__ping__':
             return frame(0, '');
