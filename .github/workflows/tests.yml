@@ -113,4 +113,7 @@ jobs:
       - name: Run the suite against it
         env:
           ROSTAM_TEST_SERVER: 127.0.0.1:7411
+          # This job started that server two steps ago and nothing else uses
+          # it, so the destructive tests (flush wipes the keyspace) may run.
+          ROSTAM_TEST_SERVER_IS_DISPOSABLE: '1'
         run: vendor/bin/phpunit

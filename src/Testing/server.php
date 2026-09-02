@@ -13,14 +13,19 @@ declare(strict_types=1);
  *   - `incr_ex` stamps its TTL only when it creates the key, and otherwise
  *     leaves the stored deadline alone;
  *   - an expired key reads as absent everywhere, so `set_nx` re-acquires;
- *   - an unknown op comes back as a plain error carrying "op not registered".
+ *   - anything it cannot carry out - an unknown op, args it could not
+ *     decode, incr_ex on a non-counter key - comes back as the same bare
+ *     "internal error", because that is all rostam distinguishes.
  *
  * Run as: php server.php [--token=...] [--drop-after=N] [--lifetime=SECONDS]
  *                        [--legacy]
  *
- * `--legacy` refuses every op added in Rostam v0.5.0, which is how the version
- * guard is tested. It prints the port it bound to on stdout, then serves until
- * killed.
+ * `--legacy` refuses every op this package uses that a pre-v0.5.0 server would
+ * not have had, `flush` (v0.6.0) included - it stands in for "a server too old
+ * for this client", not for one exact release. It exists to prove that such a
+ * server is indistinguishable from any other error, which is why there is no
+ * version guard to test any more. It prints the port it bound to on stdout,
+ * then serves until killed.
  */
 $options = getopt('', ['token::', 'drop-after::', 'lifetime::', 'legacy']);
 $token = (string) ($options['token'] ?? '');

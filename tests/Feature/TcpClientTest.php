@@ -358,11 +358,28 @@ class TcpClientTest extends TestCase
     }
 
     /**
+     * Every other test here cleans up after itself by deleting the keys it
+     * owns. A flush cannot: it has no unit smaller than the keyspace, so
+     * against a shared server it would delete data no test ever wrote.
+     */
+    private function requireADisposableServer(): void
+    {
+        if (! FakeServer::isDisposable()) {
+            $this->markTestSkipped(
+                'flush wipes the whole server, and ROSTAM_TEST_SERVER may be one that holds '
+                .'something. Set ROSTAM_TEST_SERVER_IS_DISPOSABLE=1 if it does not.'
+            );
+        }
+    }
+
+    /**
      * The op exists from v0.6.0. It is global: nothing narrows it, and the
      * argument it is sent does not.
      */
     public function test_flush_empties_the_whole_keyspace(): void
     {
+        $this->requireADisposableServer();
+
         $client = $this->client();
 
         $client->put('k', 'v');
@@ -380,6 +397,8 @@ class TcpClientTest extends TestCase
      */
     public function test_the_connection_survives_a_flush(): void
     {
+        $this->requireADisposableServer();
+
         $client = $this->client();
 
         $client->put('k', 'before');

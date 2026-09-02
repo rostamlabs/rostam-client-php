@@ -175,8 +175,17 @@ ROSTAM_TEST_SERVER=127.0.0.1:7411 vendor/bin/phpunit
 ```
 
 Five scenarios need the fake and skip themselves there: dropping a connection after
-N ops, pretending to predate v0.5.0, and demanding a token chosen per test — a real
-server fixes its auth at launch.
+N ops, standing in for a server too old for this client, and demanding a token
+chosen per test — a real server fixes its auth at launch.
+
+Two more skip for a different reason. `flush` has no unit smaller than the whole
+keyspace, so testing it against a server that holds anything else would delete
+data no test ever wrote, and nothing on the wire says whether the server is a
+scratch one. Declare it:
+
+```bash
+ROSTAM_TEST_SERVER=127.0.0.1:7411 ROSTAM_TEST_SERVER_IS_DISPOSABLE=1 vendor/bin/phpunit
+```
 
 `Rostam\Testing` ships the fake server and an in-memory `ArrayKvClient`,
 so anything built on this package can test without a socket.

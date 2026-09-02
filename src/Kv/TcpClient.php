@@ -225,8 +225,10 @@ class TcpClient implements KvClient
     // `mget` (Redis fans a key list out across the cluster; Rostam's mget is
     // routed to one shard by its first key, so `getMany` here is a client-side
     // fan-out and naming it `mget` would promise the wrong thing) and no
-    // `flushdb` (Rostam has no such op - the cache driver bumps a generation
-    // counter instead).
+    // `flushdb` (v0.6.0 added `flush`, but FLUSHDB clears ONE numbered database
+    // and leaves the others, while this clears the entire server - the same
+    // name for the wider blast radius is the one alias that could cost
+    // somebody their data, so `flush()` is only ever called by its own name).
     // ---------------------------------------------------------------------
 
     /**
