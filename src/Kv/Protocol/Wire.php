@@ -72,8 +72,13 @@ final class Wire
 
     public const OP_PING = '__ping__';
 
-    /** What the server answers when it does not know an op name. */
-    public const UNKNOWN_OP_MARKER = 'op not registered';
+    /**
+     * Wipe the whole keyspace. Rostam v0.6.0 and newer; takes no args.
+     *
+     * Passing key args does not scope it - measured against v0.6.0, a
+     * `flush` carrying the key `app:` still removed `session:b`.
+     */
+    public const OP_FLUSH = 'flush';
 
     private const MAX_KEY_LENGTH = 0xFFFF;
 

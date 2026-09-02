@@ -28,7 +28,13 @@ $dropAfter = (int) ($options['drop-after'] ?? 0);
 $lifetime = (float) ($options['lifetime'] ?? 60);
 $legacy = array_key_exists('legacy', $options);
 
-const MODERN_OPS = ['set_nx', 'cas', 'cad', 'caex', 'exists', 'getdel', 'getset', 'persist', 'ttl', 'incr_ex'];
+const MODERN_OPS = ['set_nx', 'cas', 'cad', 'caex', 'exists', 'getdel', 'getset', 'persist', 'ttl', 'incr_ex', 'flush'];
+
+// What rostam answers for anything it cannot carry out. Measured on v0.4.2
+// and v0.6.0: an unknown op, undecodable args and incr_ex on a non-counter
+// all come back byte-identical. A fake that says something more helpful
+// lets a test pass on a distinction the real server never makes.
+const GENERIC_ERROR = 'internal error';
 
 $server = stream_socket_server('tcp://127.0.0.1:0', $errorNumber, $errorMessage);
 
@@ -137,11 +143,17 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
     }
 
     if ($legacy && in_array($op, MODERN_OPS, true)) {
-        return frame(3, 'shard: op not registered: '.$op);
+        return frame(3, GENERIC_ERROR);
     }
 
     switch ($op) {
         case '__ping__':
+            return frame(0, '');
+
+        case 'flush':
+            // Global, exactly as measured: no argument narrows it.
+            $store = [];
+
             return frame(0, '');
 
         case 'get':
@@ -276,7 +288,7 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
             $entry = live($store, $key);
 
             if ($entry !== null && strlen($entry['value']) !== 8) {
-                return frame(3, 'ops: incr_ex value is not 8 bytes');
+                return frame(3, GENERIC_ERROR);
             }
 
             $next = ($entry === null ? 0 : unpack('J', $entry['value'])[1]) + $delta;
@@ -291,7 +303,7 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
             return frame(0, pack('J', $next));
     }
 
-    return frame(3, 'shard: op not registered: '.$op);
+    return frame(3, GENERIC_ERROR);
 }
 
 function deadlineFor(int $ttlMilliseconds): ?float

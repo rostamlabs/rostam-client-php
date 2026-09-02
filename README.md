@@ -15,10 +15,18 @@ which is built on this.
 
 - PHP 8.2+ on a 64-bit build
 - **Rostam v0.5.0 or newer**, started with a `-tcp` listener
+  (`flush()` alone needs **v0.6.0**)
 
 v0.5.0 is where the conditional writes (`set_nx`, `cas`, `cad`, `caex`) and
-`incr_ex` landed. Point this at an older server and it says so plainly with an
-`UnsupportedOperationException` rather than misbehaving.
+`incr_ex` landed; `flush` arrived in v0.6.0.
+
+Point this at an older server and you get a `ServerException` carrying the
+server's generic error, because that is genuinely all there is. Rostam answers a
+byte-identical `internal error` to an op it does not know, to arguments it could
+not decode, and to an ordinary application-level miss such as `incr_ex` on a key
+that is not a counter — measured on v0.4.2 and v0.6.0 alike — and it has no
+version or capability op to ask instead. This package will not guess which of
+the three it was.
 
 ```bash
 ROSTAM_API_KEY=$(openssl rand -hex 32) rostam-server -tcp 127.0.0.1:7000 -data /var/lib/rostam
@@ -88,7 +96,7 @@ matches exactly, it is available as an alias.
 | `expire` / `pexpire` | same | seconds / milliseconds |
 | `ttl` / `pttl` | same | seconds / milliseconds |
 | `mget` | **`getMany`** | deliberately not called `mget` — see below |
-| `flushdb` | — | Rostam has no such op |
+| `flushdb` | `flush` | v0.6.0+, and **global** — read the warning below before using it |
 | — | `cas` `cad` `caex` | compare-and-swap / -delete / -expire; no Redis equivalent |
 
 **Why `getMany` and not `mget`.** Rostam's `mget` is routed to a single shard by
@@ -97,10 +105,21 @@ elsewhere. `getMany` is a client-side fan-out over a pipeline: one round trip, a
 correct on any topology. Naming it `mget` would promise Redis's semantics and
 deliver something else, which is the one thing an alias must never do.
 
-**Why there is no `flushdb`.** The engine has no flush op — see
-[rostamlabs/rostam#64](https://github.com/rostamlabs/rostam/issues/64). Clients
-that need one carry a generation counter instead; the Laravel driver does exactly
-that.
+**`flush()` is not `FLUSHDB`.** Redis's `FLUSHDB` clears one numbered database
+and leaves the others. Rostam has no databases: `flush` wipes **the entire
+keyspace on that server**, whoever wrote the keys. Measured against v0.6.0:
+
+    put app:a, put session:b
+    flush                       (sent carrying the key `app:`)
+    app:a      -> not found
+    session:b  -> not found     <- the argument did not scope anything
+
+So on a shared server this destroys the other application's cache, the sessions,
+and any queued jobs that had already been accepted. Vector collections are a
+separate keyspace and survive; that was measured too. Use it when the server
+belongs to one thing and you mean all of it, and reach for a generation counter
+when you need to clear only your own keys — which is what the Laravel cache
+driver does by default.
 
 ## Errors
 
@@ -109,7 +128,6 @@ that.
 | `ConnectionException` | could not dial, timed out, or the peer went away |
 | `ProtocolException` | a frame came back malformed — the stream is out of step, do not treat this as an application-level result |
 | `ServerException` | the server refused the op; carries `status`, `op` and the payload |
-| `UnsupportedOperationException` | the server does not know this op — almost always a pre-v0.5.0 binary |
 | `StaleConnectionException` | internal: a pooled socket was dead; the client retries idempotent ops once and you never see this |
 
 ## Retries, and what is never retried

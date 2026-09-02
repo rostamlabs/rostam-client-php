@@ -8,7 +8,6 @@ namespace Rostam\Tests\Feature;
 use PHPUnit\Framework\TestCase;
 use Rostam\Exceptions\ConnectionException;
 use Rostam\Exceptions\ServerException;
-use Rostam\Exceptions\UnsupportedOperationException;
 use Rostam\Kv\Protocol\Status;
 use Rostam\Kv\TcpClient;
 use Rostam\Testing\FakeServer;
@@ -27,7 +26,7 @@ class TcpClientTest extends TestCase
      */
     private const KEYS = [
         'a', 'absent', 'anything', 'b', 'blob', 'brief', 'c', 'd', 'greeting',
-        'hits', 'k', 'lock', 'missing', 'name', 'nothing', 'window',
+        'hits', 'k', 'lock', 'missing', 'name', 'nothing', 'other', 'window',
     ];
 
     private ?FakeServer $server = null;
@@ -259,13 +258,16 @@ class TcpClientTest extends TestCase
             $this->assertSame(Status::ERROR, $exception->status);
             $this->assertSame('incr_ex', $exception->op);
 
-            // The WORDING is the fake's own. A real rostam-server answers this
-            // with a bare "internal error", which is worth knowing: nothing on
-            // the wire distinguishes "that value is not a counter" from "the
-            // server is in trouble", so no caller can either.
-            if (! FakeServer::isExternal()) {
-                $this->assertStringContainsString('not 8 bytes', $exception->getMessage());
-            }
+            // The same words in both modes, and deliberately unhelpful ones.
+            // The fake used to say "incr_ex value is not 8 bytes" here while a
+            // real rostam-server said "internal error", and the assertion was
+            // skipped against the real one to keep the difference quiet. That
+            // gap is how a guard elsewhere in this client came to read a
+            // message only the fake ever sent. Nothing on the wire separates
+            // "that value is not a counter" from "the server is in trouble"
+            // from "this server has never heard of incr_ex" - so the fake does
+            // not separate them either.
+            $this->assertStringContainsString('internal error', $exception->getMessage());
         }
     }
 
@@ -320,7 +322,23 @@ class TcpClientTest extends TestCase
         }
     }
 
-    public function test_an_older_server_is_named_as_the_problem(): void
+    /**
+     * An older server cannot be recognised, and this pins that it is not
+     * claimed to be.
+     *
+     * There was a guard here that turned the server's error into "your Rostam
+     * predates v0.5.0". It read a message no Rostam sends - only this
+     * package's own fake did - so it never fired in production, and the test
+     * that covered it passed against the fiction. Measured on a real v0.4.2
+     * and a real v0.6.0, an unknown op, undecodable args and `incr_ex` on a
+     * non-counter key all answer a byte-identical `internal error`, and there
+     * is no version op to ask instead.
+     *
+     * Guessing would not have been free: reading an ordinary application-level
+     * miss as a version mismatch turns Laravel's `increment()` on a
+     * non-numeric key from `false` into a thrown exception.
+     */
+    public function test_an_older_server_cannot_be_told_apart_and_is_not_guessed_at(): void
     {
         $client = $this->client(legacy: true);
 
@@ -328,14 +346,48 @@ class TcpClientTest extends TestCase
         $client->put('k', 'v');
         $this->assertSame('v', $client->get('k'));
 
-        // ...and the ones this package needs say so plainly.
+        // ...and a newer one arrives as what it is: an error from the server,
+        // with the server's own words and nothing invented on top.
         try {
             $client->setNx('k', 'v');
-            $this->fail('expected the version guard to fire');
-        } catch (UnsupportedOperationException $exception) {
+            $this->fail('expected the server to refuse the op');
+        } catch (ServerException $exception) {
             $this->assertSame('set_nx', $exception->op);
-            $this->assertStringContainsString('v0.5.0', $exception->getMessage());
+            $this->assertStringContainsString('internal error', $exception->getMessage());
         }
+    }
+
+    /**
+     * The op exists from v0.6.0. It is global: nothing narrows it, and the
+     * argument it is sent does not.
+     */
+    public function test_flush_empties_the_whole_keyspace(): void
+    {
+        $client = $this->client();
+
+        $client->put('k', 'v');
+        $client->put('other', 'w');
+
+        $client->flush();
+
+        $this->assertNull($client->get('k'));
+        $this->assertNull($client->get('other'));
+    }
+
+    /**
+     * Nothing is broken afterwards - a flush is a wipe, not a shutdown, and the
+     * same pooled connection has to keep working.
+     */
+    public function test_the_connection_survives_a_flush(): void
+    {
+        $client = $this->client();
+
+        $client->put('k', 'before');
+        $client->flush();
+        $client->put('k', 'after');
+
+        $this->assertSame('after', $client->get('k'));
+        $this->assertTrue($client->ping());
     }
 
     public function test_an_idempotent_op_survives_a_socket_closed_while_idle(): void
