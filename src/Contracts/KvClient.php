@@ -128,6 +128,22 @@ interface KvClient
     public function ttl(string $key, TimeUnit $unit = TimeUnit::Seconds): int;
 
     /**
+     * Wipe the entire keyspace on the server.
+     *
+     * GLOBAL, and there is no smaller unit. Not this client's keys, not one
+     * prefix, not one application - every key the server holds, whoever wrote
+     * it. Measured against v0.6.0: a flush sent with the key `app:` removed
+     * `session:b` as well. Vector collections are a separate keyspace and are
+     * left alone; that was measured too.
+     *
+     * So a caller sharing a server with anything else - another application, a
+     * session store, a queue holding accepted work - destroys that too. Needs
+     * Rostam v0.6.0 or newer; older servers answer the same generic error they
+     * give for any op they do not know.
+     */
+    public function flush(): void;
+
+    /**
      * Round-trip a heartbeat.
      */
     public function ping(): bool;

@@ -13,14 +13,22 @@ declare(strict_types=1);
  *   - `incr_ex` stamps its TTL only when it creates the key, and otherwise
  *     leaves the stored deadline alone;
  *   - an expired key reads as absent everywhere, so `set_nx` re-acquires;
- *   - an unknown op comes back as a plain error carrying "op not registered".
+ *   - anything it cannot carry out - an unknown op, args it could not
+ *     decode, incr_ex on a non-counter key - comes back as the same bare
+ *     "internal error", because that is all rostam distinguishes;
+ *   - with one exception, a layer lower: a frame whose header points past the
+ *     end of what arrived is named, `server: frame truncated`. Both were
+ *     measured against a real v0.6.0, and neither closes the connection.
  *
  * Run as: php server.php [--token=...] [--drop-after=N] [--lifetime=SECONDS]
  *                        [--legacy]
  *
- * `--legacy` refuses every op added in Rostam v0.5.0, which is how the version
- * guard is tested. It prints the port it bound to on stdout, then serves until
- * killed.
+ * `--legacy` refuses every op this package uses that a pre-v0.5.0 server would
+ * not have had, `flush` (v0.6.0) included - it stands in for "a server too old
+ * for this client", not for one exact release. It exists to prove that such a
+ * server is indistinguishable from any other error, which is why there is no
+ * version guard to test any more. It prints the port it bound to on stdout,
+ * then serves until killed.
  */
 $options = getopt('', ['token::', 'drop-after::', 'lifetime::', 'legacy']);
 $token = (string) ($options['token'] ?? '');
@@ -28,7 +36,18 @@ $dropAfter = (int) ($options['drop-after'] ?? 0);
 $lifetime = (float) ($options['lifetime'] ?? 60);
 $legacy = array_key_exists('legacy', $options);
 
-const MODERN_OPS = ['set_nx', 'cas', 'cad', 'caex', 'exists', 'getdel', 'getset', 'persist', 'ttl', 'incr_ex'];
+const MODERN_OPS = ['set_nx', 'cas', 'cad', 'caex', 'exists', 'getdel', 'getset', 'persist', 'ttl', 'incr_ex', 'flush'];
+
+// What rostam answers for anything it cannot carry out. Measured on v0.4.2
+// and v0.6.0: an unknown op, undecodable args and incr_ex on a non-counter
+// all come back byte-identical. A fake that says something more helpful
+// lets a test pass on a distinction the real server never makes.
+const GENERIC_ERROR = 'internal error';
+
+// The one exception, and it lives a layer lower: a frame whose own header
+// points past the end of what arrived is named. Measured on v0.6.0 -
+// body "put" answers `server: frame truncated`, not `internal error`.
+const TRUNCATED_FRAME = 'server: frame truncated';
 
 $server = stream_socket_server('tcp://127.0.0.1:0', $errorNumber, $errorMessage);
 
@@ -130,18 +149,72 @@ fclose($server);
  */
 function respond(string $body, string $token, bool $legacy, array &$store): string
 {
-    [$op, $args, $sent] = decodeBody($body);
+    // Outside the try below on purpose no longer: a header pointing past the
+    // end of the body used to raise here and take the process with it, which is
+    // one thing the real server never does.
+    try {
+        [$op, $args, $sent] = decodeBody($body);
+    } catch (Throwable) {
+        return frame(3, TRUNCATED_FRAME);
+    }
 
     if ($token !== '' && $sent !== $token) {
         return frame(4, 'invalid token');
     }
 
     if ($legacy && in_array($op, MODERN_OPS, true)) {
-        return frame(3, 'shard: op not registered: '.$op);
+        return frame(3, GENERIC_ERROR);
     }
 
+    // Args this fake cannot decode reach `unpack` short and raise. rostam does
+    // not get to crash on a malformed request and neither does its stand-in:
+    // it answers the same thing it answers for everything else it cannot carry
+    // out, which is what the docblock above promises.
+    try {
+        return dispatch($op, $args, $store);
+    } catch (Throwable) {
+        return frame(3, GENERIC_ERROR);
+    }
+}
+
+/**
+ * Read a declared run of bytes, or refuse.
+ *
+ * `substr` shortens silently, which is the wrong shape for a wire format: a
+ * `get` whose key claims five bytes and carries two would have been served as
+ * an ordinary miss on a two-byte key. The real server answers `internal error`,
+ * so a length that cannot be honoured has to stop here.
+ */
+function take(string $args, int $offset, int $length): string
+{
+    if ($length < 0 || $offset + $length > strlen($args)) {
+        throw new UnexpectedValueException('args declare more bytes than they carry');
+    }
+
+    return substr($args, $offset, $length);
+}
+
+/**
+ * @return array{int, int} the value at $offset, and the offset after it
+ */
+function takeNumber(string $args, int $offset, string $format, int $width): array
+{
+    return [unpack($format, take($args, $offset, $width))[1], $offset + $width];
+}
+
+/**
+ * @param  array<string, array{value: string, expires: float|null}>  $store
+ */
+function dispatch(string $op, string $args, array &$store): string
+{
     switch ($op) {
         case '__ping__':
+            return frame(0, '');
+
+        case 'flush':
+            // Global, exactly as measured: no argument narrows it.
+            $store = [];
+
             return frame(0, '');
 
         case 'get':
@@ -231,9 +304,9 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
             return frame(0, foundValue($entry === null ? null : $entry['value']));
 
         case 'expire':
-            $keyLength = unpack('n', substr($args, 0, 2))[1];
-            $key = substr($args, 2, $keyLength);
-            $ttl = unpack('J', substr($args, 2 + $keyLength, 8))[1];
+            [$keyLength, $offset] = takeNumber($args, 0, 'n', 2);
+            $key = take($args, $offset, $keyLength);
+            [$ttl] = takeNumber($args, $offset + $keyLength, 'J', 8);
 
             if (live($store, $key) === null) {
                 return frame(1, '');
@@ -269,14 +342,14 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
             return frame(0, pack('J', (int) max(0, ($entry['expires'] - microtime(true)) * 1000)));
 
         case 'incr_ex':
-            $keyLength = unpack('n', substr($args, 0, 2))[1];
-            $key = substr($args, 2, $keyLength);
-            $delta = unpack('J', substr($args, 2 + $keyLength, 8))[1];
-            $ttl = unpack('J', substr($args, 10 + $keyLength, 8))[1];
+            [$keyLength, $offset] = takeNumber($args, 0, 'n', 2);
+            $key = take($args, $offset, $keyLength);
+            [$delta, $offset] = takeNumber($args, $offset + $keyLength, 'J', 8);
+            [$ttl] = takeNumber($args, $offset, 'J', 8);
             $entry = live($store, $key);
 
             if ($entry !== null && strlen($entry['value']) !== 8) {
-                return frame(3, 'ops: incr_ex value is not 8 bytes');
+                return frame(3, GENERIC_ERROR);
             }
 
             $next = ($entry === null ? 0 : unpack('J', $entry['value'])[1]) + $delta;
@@ -291,7 +364,7 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
             return frame(0, pack('J', $next));
     }
 
-    return frame(3, 'shard: op not registered: '.$op);
+    return frame(3, GENERIC_ERROR);
 }
 
 function deadlineFor(int $ttlMilliseconds): ?float
@@ -309,12 +382,11 @@ function foundValue(?string $value): string
  */
 function decodeValueArgs(string $args): array
 {
-    $keyLength = unpack('n', substr($args, 0, 2))[1];
-    $key = substr($args, 2, $keyLength);
-    $offset = 2 + $keyLength;
-    $valueLength = unpack('N', substr($args, $offset, 4))[1];
-    $value = substr($args, $offset + 4, $valueLength);
-    $ttl = unpack('J', substr($args, $offset + 4 + $valueLength, 8))[1];
+    [$keyLength, $offset] = takeNumber($args, 0, 'n', 2);
+    $key = take($args, $offset, $keyLength);
+    [$valueLength, $offset] = takeNumber($args, $offset + $keyLength, 'N', 4);
+    $value = take($args, $offset, $valueLength);
+    [$ttl] = takeNumber($args, $offset + $valueLength, 'J', 8);
 
     return [$key, $value, $ttl];
 }
@@ -343,12 +415,11 @@ function decodeCasArgs(string $args): array
  */
 function decodeCompareArgs(string $args, bool $withTtl = false): array
 {
-    $keyLength = unpack('n', substr($args, 0, 2))[1];
-    $key = substr($args, 2, $keyLength);
-    $offset = 2 + $keyLength;
-    $expectedLength = unpack('N', substr($args, $offset, 4))[1];
-    $expected = substr($args, $offset + 4, $expectedLength);
-    $ttl = $withTtl ? unpack('J', substr($args, $offset + 4 + $expectedLength, 8))[1] : 0;
+    [$keyLength, $offset] = takeNumber($args, 0, 'n', 2);
+    $key = take($args, $offset, $keyLength);
+    [$expectedLength, $offset] = takeNumber($args, $offset + $keyLength, 'N', 4);
+    $expected = take($args, $offset, $expectedLength);
+    $ttl = $withTtl ? takeNumber($args, $offset + $expectedLength, 'J', 8)[0] : 0;
 
     return [$key, $expected, $ttl];
 }
@@ -362,24 +433,23 @@ function decodeBody(string $body): array
     $offset = 0;
 
     if ($body !== '' && ord($body[0]) === 0x02) {
-        $tokenLength = ord($body[1]);
-        $sentToken = substr($body, 2, $tokenLength);
+        $tokenLength = ord(take($body, 1, 1));
+        $sentToken = take($body, 2, $tokenLength);
         $offset = 2 + $tokenLength;
     }
 
-    $opLength = ord($body[$offset]);
-    $op = substr($body, $offset + 1, $opLength);
-    $argsOffset = $offset + 1 + $opLength;
-    $argsLength = unpack('N', substr($body, $argsOffset, 4))[1];
+    $opLength = ord(take($body, $offset, 1));
+    $op = take($body, $offset + 1, $opLength);
+    [$argsLength, $argsOffset] = takeNumber($body, $offset + 1 + $opLength, 'N', 4);
 
-    return [$op, substr($body, $argsOffset + 4, $argsLength), $sentToken];
+    return [$op, take($body, $argsOffset, $argsLength), $sentToken];
 }
 
 function decodeKey(string $args): string
 {
-    $length = unpack('n', substr($args, 0, 2))[1];
+    [$length, $offset] = takeNumber($args, 0, 'n', 2);
 
-    return substr($args, 2, $length);
+    return take($args, $offset, $length);
 }
 
 /**

@@ -5,11 +5,15 @@ declare(strict_types=1);
 
 namespace Rostam\Tests\Feature;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Rostam\Exceptions\ConnectionException;
 use Rostam\Exceptions\ServerException;
-use Rostam\Exceptions\UnsupportedOperationException;
+use Rostam\Kv\Protocol\Connection;
+use Rostam\Kv\Protocol\ConnectionConfig;
+use Rostam\Kv\Protocol\Response;
 use Rostam\Kv\Protocol\Status;
+use Rostam\Kv\Protocol\Wire;
 use Rostam\Kv\TcpClient;
 use Rostam\Testing\FakeServer;
 use Rostam\TimeUnit;
@@ -27,7 +31,7 @@ class TcpClientTest extends TestCase
      */
     private const KEYS = [
         'a', 'absent', 'anything', 'b', 'blob', 'brief', 'c', 'd', 'greeting',
-        'hits', 'k', 'lock', 'missing', 'name', 'nothing', 'window',
+        'hits', 'k', 'lock', 'missing', 'name', 'nothing', 'other', 'window',
     ];
 
     private ?FakeServer $server = null;
@@ -259,13 +263,16 @@ class TcpClientTest extends TestCase
             $this->assertSame(Status::ERROR, $exception->status);
             $this->assertSame('incr_ex', $exception->op);
 
-            // The WORDING is the fake's own. A real rostam-server answers this
-            // with a bare "internal error", which is worth knowing: nothing on
-            // the wire distinguishes "that value is not a counter" from "the
-            // server is in trouble", so no caller can either.
-            if (! FakeServer::isExternal()) {
-                $this->assertStringContainsString('not 8 bytes', $exception->getMessage());
-            }
+            // The same words in both modes, and deliberately unhelpful ones.
+            // The fake used to say "incr_ex value is not 8 bytes" here while a
+            // real rostam-server said "internal error", and the assertion was
+            // skipped against the real one to keep the difference quiet. That
+            // gap is how a guard elsewhere in this client came to read a
+            // message only the fake ever sent. Nothing on the wire separates
+            // "that value is not a counter" from "the server is in trouble"
+            // from "this server has never heard of incr_ex" - so the fake does
+            // not separate them either.
+            $this->assertStringContainsString('internal error', $exception->getMessage());
         }
     }
 
@@ -320,7 +327,23 @@ class TcpClientTest extends TestCase
         }
     }
 
-    public function test_an_older_server_is_named_as_the_problem(): void
+    /**
+     * An older server cannot be recognised, and this pins that it is not
+     * claimed to be.
+     *
+     * There was a guard here that turned the server's error into "your Rostam
+     * predates v0.5.0". It read a message no Rostam sends - only this
+     * package's own fake did - so it never fired in production, and the test
+     * that covered it passed against the fiction. Measured on a real v0.4.2
+     * and a real v0.6.0, an unknown op, undecodable args and `incr_ex` on a
+     * non-counter key all answer a byte-identical `internal error`, and there
+     * is no version op to ask instead.
+     *
+     * Guessing would not have been free: reading an ordinary application-level
+     * miss as a version mismatch turns Laravel's `increment()` on a
+     * non-numeric key from `false` into a thrown exception.
+     */
+    public function test_an_older_server_cannot_be_told_apart_and_is_not_guessed_at(): void
     {
         $client = $this->client(legacy: true);
 
@@ -328,14 +351,149 @@ class TcpClientTest extends TestCase
         $client->put('k', 'v');
         $this->assertSame('v', $client->get('k'));
 
-        // ...and the ones this package needs say so plainly.
+        // ...and a newer one arrives as what it is: an error from the server,
+        // with the server's own words and nothing invented on top.
         try {
             $client->setNx('k', 'v');
-            $this->fail('expected the version guard to fire');
-        } catch (UnsupportedOperationException $exception) {
+            $this->fail('expected the server to refuse the op');
+        } catch (ServerException $exception) {
             $this->assertSame('set_nx', $exception->op);
-            $this->assertStringContainsString('v0.5.0', $exception->getMessage());
+            $this->assertStringContainsString('internal error', $exception->getMessage());
         }
+    }
+
+    /**
+     * Keyed, so a failure names the shape that broke rather than an index.
+     *
+     * @return array<string, array{string, string}>
+     */
+    public static function malformedArgs(): array
+    {
+        // Written with pack() rather than a double-quoted byte escape:
+        // these are declared LENGTHS, which pack says out loud, and an escape
+        // written the other way gets folded into raw bytes by the formatter,
+        // which turns this file binary and its diff unreadable in review.
+        return [
+            'put: key declares five bytes, carries two' => [Wire::OP_PUT, pack('n', 5).'ab'],
+            'get: key declares five bytes, carries two' => [Wire::OP_GET, pack('n', 5).'ab'],
+            'cas: value declares nine bytes, carries two' => [Wire::OP_CAS, pack('n', 2).'ab'.pack('N', 9).'xy'],
+            // These two decode their args inline rather than through the shared
+            // helpers, which is exactly how the same mistake survives a fix.
+            'expire: key declares five bytes, carries two' => [Wire::OP_EXPIRE, pack('n', 5).'ab'],
+            'incr_ex: key declares five bytes, carries two' => [Wire::OP_INCR_EX, pack('n', 5).'ab'],
+        ];
+    }
+
+    /**
+     * Frames this client would never send, answered the way rostam answers them.
+     *
+     * Two ways to get this wrong, and the stub had both. A short VALUE reached
+     * `unpack` and raised, killing the server process. A short KEY did not even
+     * raise - `substr` shortens in silence - so a truncated `get` came back as
+     * an ordinary miss on a shorter key, which is a wrong answer rather than a
+     * loud one. A real v0.6.0 answers `internal error` to all three, so these
+     * run in both modes and the promise is the server's, not the fake's.
+     */
+    #[DataProvider('malformedArgs')]
+    public function test_undecodable_args_are_answered_not_crashed_on(string $op, string $args): void
+    {
+        $client = $this->client();
+
+        $response = $this->sendRaw(Wire::frame($op, $args));
+
+        $this->assertSame(Status::ERROR, $response->status);
+        $this->assertStringContainsString('internal error', $response->payload);
+
+        // ...and the server is still there to serve the next test.
+        $this->assertTrue($client->ping());
+    }
+
+    /**
+     * The one malformed request rostam names, and it is named a layer lower.
+     *
+     * A body whose own header points past the end of what arrived never reaches
+     * an op at all, so it is not "something the server could not carry out" and
+     * does not get the generic answer. Measured on v0.6.0: `server: frame
+     * truncated`. The stub decoded the body outside its guard and died here.
+     */
+    public function test_a_frame_that_points_past_its_own_end_is_named(): void
+    {
+        $client = $this->client();
+
+        // op length 3, "put", and one byte where a four-byte args length goes.
+        $body = chr(3).'put'.chr(1);
+        $response = $this->sendRaw(pack('N', strlen($body)).$body);
+
+        $this->assertSame(Status::ERROR, $response->status);
+        $this->assertStringContainsString('frame truncated', $response->payload);
+
+        $this->assertTrue($client->ping());
+    }
+
+    /** Write bytes this client's own encoders would never produce. */
+    private function sendRaw(string $frame): Response
+    {
+        $connection = new Connection(ConnectionConfig::fromArray($this->server->connectionConfig()));
+        $connection->open();
+        $connection->write($frame);
+
+        try {
+            return $connection->readResponse();
+        } finally {
+            $connection->close();
+        }
+    }
+
+    /**
+     * Every other test here cleans up after itself by deleting the keys it
+     * owns. A flush cannot: it has no unit smaller than the keyspace, so
+     * against a shared server it would delete data no test ever wrote.
+     */
+    private function requireADisposableServer(): void
+    {
+        if (! FakeServer::isDisposable()) {
+            $this->markTestSkipped(
+                'flush wipes the whole server, and ROSTAM_TEST_SERVER may be one that holds '
+                .'something. Set ROSTAM_TEST_SERVER_IS_DISPOSABLE=1 if it does not.'
+            );
+        }
+    }
+
+    /**
+     * The op exists from v0.6.0. It is global: nothing narrows it, and the
+     * argument it is sent does not.
+     */
+    public function test_flush_empties_the_whole_keyspace(): void
+    {
+        $this->requireADisposableServer();
+
+        $client = $this->client();
+
+        $client->put('k', 'v');
+        $client->put('other', 'w');
+
+        $client->flush();
+
+        $this->assertNull($client->get('k'));
+        $this->assertNull($client->get('other'));
+    }
+
+    /**
+     * Nothing is broken afterwards - a flush is a wipe, not a shutdown, and the
+     * same pooled connection has to keep working.
+     */
+    public function test_the_connection_survives_a_flush(): void
+    {
+        $this->requireADisposableServer();
+
+        $client = $this->client();
+
+        $client->put('k', 'before');
+        $client->flush();
+        $client->put('k', 'after');
+
+        $this->assertSame('after', $client->get('k'));
+        $this->assertTrue($client->ping());
     }
 
     public function test_an_idempotent_op_survives_a_socket_closed_while_idle(): void

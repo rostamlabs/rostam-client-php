@@ -41,6 +41,27 @@ final class FakeServer
     }
 
     /**
+     * Whether this server may be destroyed by the test using it.
+     *
+     * A fake is a fresh process per test and always is. A real one named by
+     * ROSTAM_TEST_SERVER is shared and remembers, so a test that wipes the
+     * keyspace - `flush` has no smaller unit - would take whatever else lives
+     * there with it. Nothing on the wire says whether that server is a scratch
+     * one, so the operator declares it and destructive tests skip until they
+     * do. The conformance CI job starts its own server and sets the flag.
+     *
+     * Only an affirmative value counts. Reading "any value at all" would have
+     * let somebody who wrote `=0` to mean no lose their keyspace, and this flag
+     * exists for exactly that person; anything unrecognised skips the tests,
+     * which costs a little coverage and nothing else.
+     */
+    public static function isDisposable(): bool
+    {
+        return ! self::isExternal()
+            || filter_var((string) getenv('ROSTAM_TEST_SERVER_IS_DISPOSABLE'), FILTER_VALIDATE_BOOL);
+    }
+
+    /**
      * Is the suite pointed at a real server rather than this fake?
      */
     public static function isExternal(): bool
@@ -62,7 +83,8 @@ final class FakeServer
 
     /**
      * @param  int  $dropAfter  close each connection after serving this many ops (0 = never)
-     * @param  bool  $legacy  refuse every op added in Rostam v0.5.0
+     * @param  bool  $legacy  refuse every op a pre-v0.5.0 server would not have
+     *                        had, `flush` (v0.6.0) included
      */
     public static function start(string $token = '', int $dropAfter = 0, float $lifetime = 60, bool $legacy = false): self
     {

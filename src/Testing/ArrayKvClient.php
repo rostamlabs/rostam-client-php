@@ -188,7 +188,11 @@ final class ArrayKvClient implements KvClient
         $entry = $this->live($key);
 
         if ($entry !== null && strlen($entry['value']) !== 8) {
-            throw new ServerException(Status::ERROR, 'ops: incr_ex value is not 8 bytes', 'incr_ex');
+            // The words rostam itself uses. It reports an unknown op, args it
+            // could not decode and this - an ordinary miss - with one
+            // indistinguishable message, so a fake that explains itself lets a
+            // test rely on a distinction production never offers.
+            throw new ServerException(Status::ERROR, 'internal error', 'incr_ex');
         }
 
         $next = ($entry === null ? 0 : unpack('J', $entry['value'])[1]) + $delta;
@@ -244,6 +248,12 @@ final class ArrayKvClient implements KvClient
         return $entry['expires'] === null
             ? -1
             : $unit->fromMilliseconds((int) max(0, ($entry['expires'] - microtime(true)) * 1000));
+    }
+
+    public function flush(): void
+    {
+        $this->ops[] = 'flush';
+        $this->store = [];
     }
 
     public function ping(): bool

@@ -9,12 +9,10 @@ use Rostam\Contracts\KvClient;
 use Rostam\Exceptions\ConnectionException;
 use Rostam\Exceptions\ServerException;
 use Rostam\Exceptions\StaleConnectionException;
-use Rostam\Exceptions\UnsupportedOperationException;
 use Rostam\Kv\Protocol\Connection;
 use Rostam\Kv\Protocol\ConnectionConfig;
 use Rostam\Kv\Protocol\ConnectionPool;
 use Rostam\Kv\Protocol\Response;
-use Rostam\Kv\Protocol\Status;
 use Rostam\Kv\Protocol\Wire;
 use Rostam\TimeUnit;
 use Throwable;
@@ -227,8 +225,10 @@ class TcpClient implements KvClient
     // `mget` (Redis fans a key list out across the cluster; Rostam's mget is
     // routed to one shard by its first key, so `getMany` here is a client-side
     // fan-out and naming it `mget` would promise the wrong thing) and no
-    // `flushdb` (Rostam has no such op - the cache driver bumps a generation
-    // counter instead).
+    // `flushdb` (v0.6.0 added `flush`, but FLUSHDB clears ONE numbered database
+    // and leaves the others, while this clears the entire server - the same
+    // name for the wider blast radius is the one alias that could cost
+    // somebody their data, so `flush()` is only ever called by its own name).
     // ---------------------------------------------------------------------
 
     /**
@@ -310,6 +310,16 @@ class TcpClient implements KvClient
         return $this->ttl($key, TimeUnit::Milliseconds);
     }
 
+    public function flush(): void
+    {
+        // Not idempotent for retry purposes. Re-sending after an ambiguous
+        // failure would be harmless on its own - a second wipe of an empty
+        // keyspace changes nothing - but between the two attempts another
+        // writer may have put something back, and the retry would take that
+        // with it.
+        $this->call(new Command(Wire::OP_FLUSH, ''));
+    }
+
     public function ping(): bool
     {
         $this->call(new Command(Wire::OP_PING, '', idempotent: true));
@@ -355,17 +365,21 @@ class TcpClient implements KvClient
                 continue;
             }
 
-            $op = $commands[$index]->op;
-
-            // An op the server has never heard of means the binary predates the
-            // conditional writes this package is built on. Say so, rather than
-            // letting it surface as a generic server error the store swallows.
-            if ($response->status === Status::ERROR
-                && str_contains($response->payload, Wire::UNKNOWN_OP_MARKER)) {
-                throw new UnsupportedOperationException($op, $response->payload);
-            }
-
-            throw new ServerException($response->status, $response->payload, $op);
+            // There used to be a check here that turned a generic error into
+            // "your server is too old". It could not work and never fired.
+            // Measured against v0.4.2 and v0.6.0, the server answers a byte-
+            // identical `internal error` to all three of:
+            //
+            //     an op it does not know          (a server that is too old)
+            //     args it could not decode        (a bug in this client)
+            //     incr_ex on a non-counter key    (an ordinary application miss)
+            //
+            // Nothing in the response separates them, and there is no version
+            // or capability op to ask instead. A guess would have been worse
+            // than silence: reading the third as the first would have turned
+            // Laravel's `increment()` on a non-numeric key from `false` into a
+            // thrown exception.
+            throw new ServerException($response->status, $response->payload, $commands[$index]->op);
         }
 
         return $responses;
