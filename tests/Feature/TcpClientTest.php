@@ -363,7 +363,9 @@ class TcpClientTest extends TestCase
     }
 
     /**
-     * @return list<array{string, string}>
+     * Keyed, so a failure names the shape that broke rather than an index.
+     *
+     * @return array<string, array{string, string}>
      */
     public static function malformedArgs(): array
     {
