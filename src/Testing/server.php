@@ -185,11 +185,13 @@ while (microtime(true) < $deadline) {
             // The real server's own bound, on the length prefix alone: an empty
             // body or one over 16 MiB is not answered, the connection is closed.
             // A fake that read any size would let a client send what no rostam
-            // will read and pass.
+            // will read and pass. Answers to the frames before it still go out
+            // first, as they do from v0.6.0 through v0.7.0-beta7.
             if ($length === 0 || $length > MAX_FRAME_BODY) {
-                $drop($id);
+                $buffers[$id] = '';
+                $closeWhenFlushed[$id] = true;
 
-                continue 2;
+                break;
             }
 
             if (strlen($buffers[$id]) < 4 + $length) {
@@ -228,15 +230,16 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
     try {
         [$op, $args, $sent] = decodeBody($body);
     } catch (Throwable) {
-        return frame(3, TRUNCATED_FRAME);
+        return errorFrame(TRUNCATED_FRAME);
     }
 
+    // No reason given: rostam answers a refused token with an empty payload.
     if ($token !== '' && $sent !== $token) {
-        return frame(4, 'invalid token');
+        return frame(4, '');
     }
 
     if ($legacy && in_array($op, MODERN_OPS, true)) {
-        return frame(3, GENERIC_ERROR);
+        return errorFrame(GENERIC_ERROR);
     }
 
     // Args this fake cannot decode reach `unpack` short and raise. rostam does
@@ -246,7 +249,7 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
     try {
         return dispatch($op, $args, $store);
     } catch (Throwable) {
-        return frame(3, GENERIC_ERROR);
+        return errorFrame(GENERIC_ERROR);
     }
 }
 
@@ -447,7 +450,7 @@ function dispatch(string $op, string $args, array &$store): string
             $entry = live($store, $key);
 
             if ($entry !== null && strlen($entry['value']) !== 8) {
-                return frame(3, GENERIC_ERROR);
+                return errorFrame(GENERIC_ERROR);
             }
 
             $next = ($entry === null ? 0 : unpack('J', $entry['value'])[1]) + $delta;
@@ -462,7 +465,7 @@ function dispatch(string $op, string $args, array &$store): string
             return frame(0, pack('J', $next));
     }
 
-    return frame(3, GENERIC_ERROR);
+    return errorFrame(GENERIC_ERROR);
 }
 
 function deadlineFor(int $ttlMilliseconds): ?float
@@ -605,4 +608,15 @@ function live(array &$store, string $key): ?array
 function frame(int $status, string $payload): string
 {
     return pack('N', 5 + strlen($payload)).chr($status).pack('N', strlen($payload)).$payload;
+}
+
+/**
+ * An ERROR answer, carrying its text the way rostam does: [textLen u16][text].
+ * This stub used to send the bare text, which is kinder than the server - a
+ * client that forgot the prefix passed here and put a NUL into every real
+ * exception message.
+ */
+function errorFrame(string $message): string
+{
+    return frame(3, pack('n', strlen($message)).$message);
 }

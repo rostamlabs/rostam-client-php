@@ -75,7 +75,9 @@ final class KvMetrics
      * quote. It comes back in a canonical form - labels sorted by name - so
      * the same series written in another order is still caught as a repeat,
      * and an empty `{}` is the unlabelled sample it means rather than a
-     * separate series nobody would look up.
+     * separate series nobody would look up. Blanks are allowed where
+     * Prometheus's own parser allows them: before the brace, and around the
+     * names, `=`, commas and the closing brace.
      *
      * @return array{0: string, 1: string, 2: string} name, canonical label set, raw value
      */
@@ -92,9 +94,10 @@ final class KvMetrics
         $name = $match[0];
         $at = strlen($name);
         $labels = [];
+        $brace = $at + strspn($line, " \t", $at);
 
-        if (($line[$at] ?? '') === '{') {
-            $at++;
+        if (($line[$brace] ?? '') === '{') {
+            $at = $brace + 1;
 
             while (true) {
                 $at += strspn($line, " \t", $at);
@@ -111,12 +114,20 @@ final class KvMetrics
 
                 $label = $match[0];
                 $at += strlen($label);
+                $at += strspn($line, " \t", $at);
 
-                if (($line[$at] ?? '') !== '=' || ($line[$at + 1] ?? '') !== '"') {
+                if (($line[$at] ?? '') !== '=') {
                     throw $malformed("label {$label} is not name=\"value\"");
                 }
 
-                $at += 2;
+                $at++;
+                $at += strspn($line, " \t", $at);
+
+                if (($line[$at] ?? '') !== '"') {
+                    throw $malformed("label {$label} is not name=\"value\"");
+                }
+
+                $at++;
                 $value = '';
 
                 while (true) {

@@ -226,8 +226,8 @@ not on `KvClient`: an existing implementation of `KvClient` keeps loading.
 | Exception | Means |
 | --- | --- |
 | `ConnectionException` | could not dial, timed out, or the peer went away |
-| `ProtocolException` | a frame came back malformed — the stream is out of step, do not treat this as an application-level result |
-| `ServerException` | the server refused the op; carries `status`, `op` and the payload |
+| `ProtocolException` | a frame came back malformed — the stream is out of step, do not treat this as an application-level result. Also thrown *before sending* for a request that cannot be encoded — a body over 16 MiB, a key or token too long for its length field, a negative TTL; then nothing was sent and no connection is affected |
+| `ServerException` | the server refused the op; carries `status`, `op` and `detail` — the server's text, decoded from its length prefix (empty for a refused token) |
 | `TopologyMismatchException` | a connection declared `single-node` met a server reporting replicated shards; nothing was written |
 | `StaleConnectionException` | internal: a pooled socket was dead; the client retries idempotent ops once and you never see this |
 

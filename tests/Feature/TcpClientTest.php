@@ -272,7 +272,12 @@ class TcpClientTest extends TestCase
             // "that value is not a counter" from "the server is in trouble"
             // from "this server has never heard of incr_ex" - so the fake does
             // not separate them either.
-            $this->assertStringContainsString('internal error', $exception->getMessage());
+            //
+            // Exact, not "contains": the server sends the text behind a u16
+            // length, and a contains-check passed for as long as this client
+            // left those two bytes in the message.
+            $this->assertSame('internal error', $exception->detail);
+            $this->assertSame('incr_ex: server error: internal error', $exception->getMessage());
         }
     }
 
@@ -324,6 +329,9 @@ class TcpClientTest extends TestCase
             $this->fail('expected the server to reject the token');
         } catch (ServerException $exception) {
             $this->assertTrue($exception->isUnauthorized());
+
+            // rostam gives no reason with a refused token.
+            $this->assertSame('', $exception->detail);
         }
     }
 
@@ -358,7 +366,7 @@ class TcpClientTest extends TestCase
             $this->fail('expected the server to refuse the op');
         } catch (ServerException $exception) {
             $this->assertSame('set_nx', $exception->op);
-            $this->assertStringContainsString('internal error', $exception->getMessage());
+            $this->assertSame('internal error', $exception->detail);
         }
     }
 
@@ -401,8 +409,9 @@ class TcpClientTest extends TestCase
 
         $response = $this->sendRaw(Wire::frame($op, $args));
 
+        // The bytes as they cross the wire: the text behind its u16 length.
         $this->assertSame(Status::ERROR, $response->status);
-        $this->assertStringContainsString('internal error', $response->payload);
+        $this->assertSame(pack('n', 14).'internal error', $response->payload);
 
         // ...and the server is still there to serve the next test.
         $this->assertTrue($client->ping());
@@ -425,7 +434,7 @@ class TcpClientTest extends TestCase
         $response = $this->sendRaw(pack('N', strlen($body)).$body);
 
         $this->assertSame(Status::ERROR, $response->status);
-        $this->assertStringContainsString('frame truncated', $response->payload);
+        $this->assertSame(pack('n', 23).'server: frame truncated', $response->payload);
 
         $this->assertTrue($client->ping());
     }
@@ -463,6 +472,35 @@ class TcpClientTest extends TestCase
 
         // The server itself is unharmed.
         $this->assertTrue($client->ping());
+    }
+
+    /**
+     * The refused frame takes the connection, not the answers already owed on
+     * it. Measured on v0.6.0, v0.7.0-beta6 and v0.7.0-beta7: a ping, then an
+     * oversized prefix in the same write - the ping is answered, then the
+     * socket closes. The fake used to discard the queued answer with the
+     * socket, which no client could see coming from a real server.
+     */
+    public function test_answers_owed_before_an_oversized_frame_still_arrive(): void
+    {
+        $this->client();
+
+        $connection = new Connection(ConnectionConfig::fromArray($this->server->connectionConfig(['timeout' => 1.0])));
+        $connection->open();
+        $connection->write(Wire::frame(Wire::OP_PING, '').pack('N', 16 * 1024 * 1024 + 1));
+
+        try {
+            $this->assertSame(Status::OK, $connection->readResponse()->status);
+
+            try {
+                $connection->readResponse();
+                $this->fail('a body over the frame limit was answered');
+            } catch (ConnectionException $exception) {
+                $this->assertStringContainsString('closed by the server', $exception->getMessage());
+            }
+        } finally {
+            $connection->close();
+        }
     }
 
     /** Write bytes this client's own encoders would never produce. */

@@ -97,6 +97,25 @@ class KvMetricsTest extends TestCase
         $this->assertSame(['{note="say \"hi\"",path="a}b,c"}' => 7], $metrics->series(KvMetrics::ENTRIES));
     }
 
+    /**
+     * Blanks where Prometheus's text parser skips them - before the brace and
+     * around every token inside it - are the same series written loosely.
+     */
+    public function test_blanks_inside_and_before_a_label_set_are_allowed(): void
+    {
+        $metrics = KvMetrics::fromPrometheusText(
+            'rostam_kv_entries {a="1"} 5'."\n"
+            .'rostam_kv_entries{ a = "2" , b="x y" , } 6'."\n"
+            ."rostam_kv_entries\t{\tb\t=\t\"3\"\t} 7\n"
+        );
+
+        $this->assertSame(
+            ['{a="1"}' => 5, '{a="2",b="x y"}' => 6, '{b="3"}' => 7],
+            $metrics->series(KvMetrics::ENTRIES),
+        );
+        $this->assertFalse($metrics->has(KvMetrics::ENTRIES));
+    }
+
     /** The same series in another label order is the same series, and a repeat is still refused. */
     public function test_a_series_repeated_in_another_label_order_is_refused(): void
     {
@@ -117,6 +136,8 @@ class KvMetricsTest extends TestCase
             'no separator' => ['rostam_kv_entries{a="1" b="2"} 5'],
             'the same label twice' => ['rostam_kv_entries{a="1",a="2"} 5'],
             'an unknown escape' => ['rostam_kv_entries{a="\q"} 5'],
+            'a blank inside a label name' => ['rostam_kv_entries{a b="1"} 5'],
+            'no value after the labels' => ['rostam_kv_entries {a="1"}'],
         ];
     }
 

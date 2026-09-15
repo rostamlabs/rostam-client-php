@@ -78,8 +78,10 @@ jobs:
     # Twice. GitHub's releases/latest skips pre-releases, so it answers the stable
     # server people run today - and a lane that only ever saw that one would
     # never meet an op that arrived in a beta. The pre-release lane takes the
-    # newest release of any kind. Tests for an op newer than the server they
-    # meet skip, by the version this job reads from the binary itself.
+    # highest version of any kind, pre-releases included - by version, not by
+    # date, so a patch to an old line published last cannot displace a newer
+    # beta. Tests for an op newer than the server they meet skip, by the version
+    # this job exports.
     strategy:
       fail-fast: false
       matrix:

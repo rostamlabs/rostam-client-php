@@ -328,7 +328,7 @@ class PutManyTopologyTest extends TestCase
             $this->fail('a truncated batch was accepted');
         } catch (ServerException $exception) {
             $this->assertSame(Status::ERROR, $exception->status);
-            $this->assertStringContainsString('internal error', $exception->getMessage());
+            $this->assertSame('internal error', $exception->detail);
         }
 
         $this->assertNull($this->plainClient()->get($first[0]), 'the first entry of a refused batch was applied');
@@ -392,7 +392,7 @@ final class FailsTheFirstTopologyCheck extends RecordingClient
         foreach ($commands as $index => $command) {
             if ($command->op === Wire::OP_REPL_METRICS && ! $this->failed) {
                 $this->failed = true;
-                $responses[$index] = new Response(Status::ERROR, 'internal error');
+                $responses[$index] = new Response(Status::ERROR, pack('n', 14).'internal error');
             }
         }
 

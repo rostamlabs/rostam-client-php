@@ -18,6 +18,7 @@ use Rostam\Kv\Protocol\Connection;
 use Rostam\Kv\Protocol\ConnectionConfig;
 use Rostam\Kv\Protocol\ConnectionPool;
 use Rostam\Kv\Protocol\Response;
+use Rostam\Kv\Protocol\Status;
 use Rostam\Kv\Protocol\Topology;
 use Rostam\Kv\Protocol\Wire;
 use Rostam\TimeUnit;
@@ -551,7 +552,11 @@ class TcpClient implements KvClient, ReportsKvMetrics
             // than silence: reading the third as the first would have turned
             // Laravel's `increment()` on a non-numeric key from `false` into a
             // thrown exception.
-            throw new ServerException($response->status, $response->payload, $commands[$index]->op);
+            $detail = in_array($response->status, [Status::ERROR, Status::NOT_LEADER], true)
+                ? Wire::decodeErrorText($response->payload)
+                : $response->payload;
+
+            throw new ServerException($response->status, $detail, $commands[$index]->op);
         }
 
         return $responses;

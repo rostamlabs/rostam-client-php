@@ -16,6 +16,7 @@ use Rostam\Exceptions\ProtocolException;
  *     body v1   [opNameLen u8][opName][argsLen u32][args]
  *     body v2   [0x02][tokenLen u8][token][opNameLen u8][opName][argsLen u32][args]
  *     response  [bodyLen u32][status u8][payloadLen u32][payload]
+ *     ERROR and NOT_LEADER payloads  [textLen u16][text]; UNAUTHORIZED carries none
  *
  * v2 is used when an auth token is configured, v1 otherwise - mirroring the Go
  * and Python clients. The key-value ops this package speaks, with the release
@@ -258,6 +259,35 @@ final class Wire
         }
 
         return $args;
+    }
+
+    /**
+     * The text an ERROR or NOT_LEADER answer carries: an error message, or the
+     * leader's address.
+     *
+     * Rostam writes both as a length-prefixed string, [textLen u16][text]
+     * (`server.EncodeErrorPayload`, `EncodeLeaderAddrPayload`). Before v0.3.0
+     * this client passed the payload through as it came, so every server error
+     * reached an exception message with a NUL and a length byte in front of
+     * "internal error". Bytes past the declared length are ignored, as the Go
+     * client ignores them. A payload too short for its own prefix is not what
+     * rostam sends; it is returned untouched, so a server that answers
+     * something else is still reported rather than silenced.
+     */
+    public static function decodeErrorText(string $payload): string
+    {
+        if (strlen($payload) < 2) {
+            return $payload;
+        }
+
+        /** @var array{1: int} $unpacked */
+        $unpacked = unpack('n', $payload);
+
+        if (strlen($payload) < 2 + $unpacked[1]) {
+            return $payload;
+        }
+
+        return substr($payload, 2, $unpacked[1]);
     }
 
     /**
