@@ -104,7 +104,12 @@ class PutManyTopologyTest extends TestCase
         $values = $this->plainClient()->getMany(array_column($entries, 0));
 
         foreach ($entries as [$key, $value]) {
-            $this->assertSame($value, $values[$key], "{$key} did not read back");
+            // A server shared with something else can lose these while the test
+            // runs: rostam evicts in write order, so another client's burst
+            // pushes them out however much room the node has. That is the
+            // engine's behaviour rather than this client's, hence the reminder.
+            $this->assertSame($value, $values[$key], "{$key} did not read back"
+                .(FakeServer::isExternal() ? ' (a busy shared server may have evicted it)' : ''));
         }
     }
 
