@@ -175,4 +175,32 @@ class WireTest extends TestCase
     {
         $this->assertSame('', Wire::decodeFoundValue("\x01".pack('N', 0)));
     }
+
+    /**
+     * Error and not-leader text travels as [textLen u16][text]. Left undecoded,
+     * every server error put a NUL and a length byte into its message.
+     */
+    public function test_it_decodes_error_text_from_its_length_prefix(): void
+    {
+        $this->assertSame('internal error', Wire::decodeErrorText(pack('n', 14).'internal error'));
+        $this->assertSame('', Wire::decodeErrorText(pack('n', 0)));
+        $this->assertSame('10.0.0.2:7000', Wire::decodeErrorText(pack('n', 13).'10.0.0.2:7000'));
+    }
+
+    public function test_error_text_ignores_bytes_past_its_declared_length(): void
+    {
+        // What the Go client does with them.
+        $this->assertSame('abc', Wire::decodeErrorText(pack('n', 3).'abcdef'));
+    }
+
+    /**
+     * Not what rostam sends. Returned as it came, so a server that answers
+     * something else is still reported instead of reduced to nothing.
+     */
+    public function test_error_text_that_does_not_fit_its_prefix_is_returned_untouched(): void
+    {
+        $this->assertSame('', Wire::decodeErrorText(''));
+        $this->assertSame('x', Wire::decodeErrorText('x'));
+        $this->assertSame(pack('n', 9).'short', Wire::decodeErrorText(pack('n', 9).'short'));
+    }
 }

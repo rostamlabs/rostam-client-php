@@ -82,19 +82,55 @@ final class FakeServer
     }
 
     /**
+     * Whether the server under test has an op that arrived in $minimum.
+     *
+     * The fake implements every op this package speaks, so it always does. A
+     * real server cannot be asked - an op it does not know answers the same
+     * `internal error` as anything else it cannot carry out - so its version is
+     * declared in ROSTAM_TEST_SERVER_VERSION, which the conformance CI job reads
+     * from `rostam-server --version`. Undeclared, the test runs: against an older
+     * server it then fails with that server's own error, which is an honest
+     * answer, where a skip would hide a newer server breaking the op.
+     */
+    public static function supports(string $minimum): bool
+    {
+        if (! self::isExternal()) {
+            return true;
+        }
+
+        $declared = getenv('ROSTAM_TEST_SERVER_VERSION');
+
+        if (! is_string($declared) || trim($declared) === '') {
+            return true;
+        }
+
+        return version_compare(ltrim(trim($declared), 'v'), ltrim($minimum, 'v'), '>=');
+    }
+
+    /**
      * @param  int  $dropAfter  close each connection after serving this many ops (0 = never)
      * @param  bool  $legacy  refuse every op a pre-v0.5.0 server would not have
-     *                        had, `flush` (v0.6.0) included
+     *                        had, `flush` (v0.6.0) and `__kv_metrics__` included
+     * @param  bool  $replicated  answer `__repl_metrics__` as a replicating cluster member would
+     * @param  int  $liveEvictions  report this many live records already lost to capacity
      */
-    public static function start(string $token = '', int $dropAfter = 0, float $lifetime = 60, bool $legacy = false): self
-    {
+    public static function start(
+        string $token = '',
+        int $dropAfter = 0,
+        float $lifetime = 60,
+        bool $legacy = false,
+        bool $replicated = false,
+        int $liveEvictions = 0,
+    ): self {
         if ($target = self::externalTarget()) {
-            if ($dropAfter > 0 || $legacy || $token !== '') {
+            if ($dropAfter > 0 || $legacy || $token !== '' || $replicated || $liveEvictions > 0) {
                 throw new RuntimeException(
                     'this scenario needs the fake server: a real one cannot be asked to '
                     .match (true) {
                         $legacy => 'predate v0.5.0',
                         $dropAfter > 0 => 'drop connections after N ops',
+                        $replicated => 'turn into a replicating cluster member',
+                        $liveEvictions > 0 => 'claim live records it never lost',
                         default => 'demand a token chosen per test - its auth is fixed at launch',
                     }
                     .'. Guard the test with FakeServer::isExternal().'
@@ -126,6 +162,14 @@ final class FakeServer
 
         if ($legacy) {
             $command[] = '--legacy';
+        }
+
+        if ($replicated) {
+            $command[] = '--replicated';
+        }
+
+        if ($liveEvictions > 0) {
+            $command[] = '--live-evictions='.$liveEvictions;
         }
 
         $process = proc_open($command, $descriptors, $pipes);

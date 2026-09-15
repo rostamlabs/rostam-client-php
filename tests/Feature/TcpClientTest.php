@@ -272,7 +272,12 @@ class TcpClientTest extends TestCase
             // "that value is not a counter" from "the server is in trouble"
             // from "this server has never heard of incr_ex" - so the fake does
             // not separate them either.
-            $this->assertStringContainsString('internal error', $exception->getMessage());
+            //
+            // Exact, not "contains": the server sends the text behind a u16
+            // length, and a contains-check passed for as long as this client
+            // left those two bytes in the message.
+            $this->assertSame('internal error', $exception->detail);
+            $this->assertSame('incr_ex: server error: internal error', $exception->getMessage());
         }
     }
 
@@ -324,6 +329,9 @@ class TcpClientTest extends TestCase
             $this->fail('expected the server to reject the token');
         } catch (ServerException $exception) {
             $this->assertTrue($exception->isUnauthorized());
+
+            // rostam gives no reason with a refused token.
+            $this->assertSame('', $exception->detail);
         }
     }
 
@@ -358,7 +366,7 @@ class TcpClientTest extends TestCase
             $this->fail('expected the server to refuse the op');
         } catch (ServerException $exception) {
             $this->assertSame('set_nx', $exception->op);
-            $this->assertStringContainsString('internal error', $exception->getMessage());
+            $this->assertSame('internal error', $exception->detail);
         }
     }
 
@@ -401,8 +409,9 @@ class TcpClientTest extends TestCase
 
         $response = $this->sendRaw(Wire::frame($op, $args));
 
+        // The bytes as they cross the wire: the text behind its u16 length.
         $this->assertSame(Status::ERROR, $response->status);
-        $this->assertStringContainsString('internal error', $response->payload);
+        $this->assertSame(pack('n', 14).'internal error', $response->payload);
 
         // ...and the server is still there to serve the next test.
         $this->assertTrue($client->ping());
@@ -425,9 +434,118 @@ class TcpClientTest extends TestCase
         $response = $this->sendRaw(pack('N', strlen($body)).$body);
 
         $this->assertSame(Status::ERROR, $response->status);
-        $this->assertStringContainsString('frame truncated', $response->payload);
+        $this->assertSame(pack('n', 23).'server: frame truncated', $response->payload);
 
         $this->assertTrue($client->ping());
+    }
+
+    /**
+     * The other name rostam gives a malformed body: args declared larger than
+     * any frame could carry. Checked before truncation, so a four-gigabyte
+     * claim on a tiny body is "too large", not "truncated" - byte for byte the
+     * same on v0.6.0, v0.7.0-beta6 and v0.7.0-beta7.
+     */
+    public function test_args_declared_past_the_frame_limit_are_named_too_large(): void
+    {
+        $client = $this->client();
+
+        $body = chr(3).'get'.pack('N', 0xFFFFFFFF).'ab';
+        $response = $this->sendRaw(pack('N', strlen($body)).$body);
+
+        $this->assertSame(Status::ERROR, $response->status);
+        $this->assertSame(pack('n', 23).'server: frame too large', $response->payload);
+
+        $this->assertTrue($client->ping());
+    }
+
+    /**
+     * Where the bound sits: on the op header and the args together. Args of
+     * exactly 16 MiB fit the old rule (the args alone) and not the new one, so
+     * this runs only where the new one was measured.
+     */
+    public function test_the_frame_limit_counts_the_op_header_with_the_args(): void
+    {
+        if (! FakeServer::supports('0.7.0-beta6')) {
+            $this->markTestSkipped('v0.6.0 compared the args length alone');
+        }
+
+        $client = $this->client();
+
+        $body = chr(3).'get'.pack('N', 16 * 1024 * 1024).'ab';
+        $response = $this->sendRaw(pack('N', strlen($body)).$body);
+
+        $this->assertSame(pack('n', 23).'server: frame too large', $response->payload);
+
+        $body = chr(3).'get'.pack('N', 16 * 1024 * 1024 - 8).'ab';
+        $response = $this->sendRaw(pack('N', strlen($body)).$body);
+
+        $this->assertSame(pack('n', 23).'server: frame truncated', $response->payload);
+
+        $this->assertTrue($client->ping());
+    }
+
+    /**
+     * A body over `server.MaxFrameSize` is not answered at all: the server
+     * closes the connection on reading the length prefix. Asserted in both
+     * modes, which is what keeps the fake from reading a size the server would
+     * not - it used to read anything, and a client assuming 64 MiB passed.
+     *
+     * Only the prefix is sent. The server decides on the four bytes alone,
+     * so the test does not have to push sixteen megabytes to make its point.
+     */
+    public function test_a_body_over_sixteen_mebibytes_is_not_answered_the_connection_is_dropped(): void
+    {
+        $client = $this->client();
+
+        // A short timeout, so a server that waits for the body instead of
+        // refusing it shows up as a timeout rather than a slow pass.
+        $connection = new Connection(ConnectionConfig::fromArray($this->server->connectionConfig(['timeout' => 1.0])));
+        $connection->open();
+        $connection->write(pack('N', 16 * 1024 * 1024 + 1).chr(3).'put');
+
+        try {
+            $connection->readResponse();
+            $this->fail('a body over the frame limit was answered');
+        } catch (ConnectionException $exception) {
+            // Closed on the prefix, not left waiting for sixteen megabytes that
+            // are never coming. Both are ConnectionExceptions; only one is the
+            // server's behaviour.
+            $this->assertStringContainsString('closed by the server', $exception->getMessage());
+        } finally {
+            $connection->close();
+        }
+
+        // The server itself is unharmed.
+        $this->assertTrue($client->ping());
+    }
+
+    /**
+     * The refused frame takes the connection, not the answers already owed on
+     * it. Measured on v0.6.0, v0.7.0-beta6 and v0.7.0-beta7: a ping, then an
+     * oversized prefix in the same write - the ping is answered, then the
+     * socket closes. The fake used to discard the queued answer with the
+     * socket, which no client could see coming from a real server.
+     */
+    public function test_answers_owed_before_an_oversized_frame_still_arrive(): void
+    {
+        $this->client();
+
+        $connection = new Connection(ConnectionConfig::fromArray($this->server->connectionConfig(['timeout' => 1.0])));
+        $connection->open();
+        $connection->write(Wire::frame(Wire::OP_PING, '').pack('N', 16 * 1024 * 1024 + 1));
+
+        try {
+            $this->assertSame(Status::OK, $connection->readResponse()->status);
+
+            try {
+                $connection->readResponse();
+                $this->fail('a body over the frame limit was answered');
+            } catch (ConnectionException $exception) {
+                $this->assertStringContainsString('closed by the server', $exception->getMessage());
+            }
+        } finally {
+            $connection->close();
+        }
     }
 
     /** Write bytes this client's own encoders would never produce. */

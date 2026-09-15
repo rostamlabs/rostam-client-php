@@ -16,38 +16,66 @@ declare(strict_types=1);
  *   - anything it cannot carry out - an unknown op, args it could not
  *     decode, incr_ex on a non-counter key - comes back as the same bare
  *     "internal error", because that is all rostam distinguishes;
- *   - with one exception, a layer lower: a frame whose header points past the
- *     end of what arrived is named, `server: frame truncated`. Both were
- *     measured against a real v0.6.0, and neither closes the connection.
+ *   - with two exceptions, a layer lower, where the body itself is decoded: a
+ *     header pointing past the end of what arrived is `server: frame
+ *     truncated`, and an args length that would take the request over 16 MiB
+ *     is `server: frame too large`. Measured against v0.6.0, v0.7.0-beta6 and
+ *     v0.7.0-beta7; none of them closes the connection;
+ *   - a length prefix of zero or over 16 MiB (`server.MaxFrameSize`) is not
+ *     answered at all: the connection is closed, as the server closes it;
+ *   - answers are buffered and written as the socket accepts them, so a large
+ *     pipelined answer arrives whole, as it does from the server.
  *
  * Run as: php server.php [--token=...] [--drop-after=N] [--lifetime=SECONDS]
- *                        [--legacy]
+ *                        [--legacy] [--replicated] [--live-evictions=N]
  *
  * `--legacy` refuses every op this package uses that a pre-v0.5.0 server would
- * not have had, `flush` (v0.6.0) included - it stands in for "a server too old
- * for this client", not for one exact release. It exists to prove that such a
- * server is indistinguishable from any other error, which is why there is no
- * version guard to test any more. It prints the port it bound to on stdout,
- * then serves until killed.
+ * not have had, `flush` (v0.6.0) and `__kv_metrics__` (v0.7.0-beta3) included -
+ * it stands in for "a server too old for this client", not for one exact
+ * release. It exists to prove that such a server is indistinguishable from any
+ * other error, which is why there is no version guard to test any more.
+ *
+ * `--replicated` answers `__repl_metrics__` with a shard list, as a cluster
+ * member would. `--live-evictions=N` reports N live records lost to capacity.
+ * Neither is a state a real single-node server can be put in on request.
+ *
+ * It prints the port it bound to on stdout, then serves until killed.
  */
-$options = getopt('', ['token::', 'drop-after::', 'lifetime::', 'legacy']);
+$options = getopt('', ['token::', 'drop-after::', 'lifetime::', 'legacy', 'replicated', 'live-evictions::']);
 $token = (string) ($options['token'] ?? '');
 $dropAfter = (int) ($options['drop-after'] ?? 0);
 $lifetime = (float) ($options['lifetime'] ?? 60);
 $legacy = array_key_exists('legacy', $options);
 
-const MODERN_OPS = ['set_nx', 'cas', 'cad', 'caex', 'exists', 'getdel', 'getset', 'persist', 'ttl', 'incr_ex', 'flush'];
+// Neither is something a real single-node server can be asked to become, which
+// is why they exist here: a replicating shard list, and a server that has
+// already lost live records to capacity.
+define('REPLICATED', array_key_exists('replicated', $options));
+define('LIVE_EVICTIONS', max(0, (int) ($options['live-evictions'] ?? 0)));
 
-// What rostam answers for anything it cannot carry out. Measured on v0.4.2
-// and v0.6.0: an unknown op, undecodable args and incr_ex on a non-counter
+const MODERN_OPS = ['set_nx', 'cas', 'cad', 'caex', 'exists', 'getdel', 'getset', 'persist', 'ttl', 'incr_ex', 'flush', '__kv_metrics__'];
+
+// What rostam answers for anything it cannot carry out. Measured on v0.4.2,
+// v0.6.0 and v0.7.0-beta6: an unknown op, undecodable args and incr_ex on a non-counter
 // all come back byte-identical. A fake that says something more helpful
 // lets a test pass on a distinction the real server never makes.
 const GENERIC_ERROR = 'internal error';
 
-// The one exception, and it lives a layer lower: a frame whose own header
-// points past the end of what arrived is named. Measured on v0.6.0 -
-// body "put" answers `server: frame truncated`, not `internal error`.
+// The two exceptions, and they live a layer lower, in decoding the body
+// itself. A frame whose own header points past the end of what arrived is
+// named: a body of op-length 3, "put", and a single byte where the four-byte
+// args length belongs answers `server: frame truncated`, not `internal error`.
 const TRUNCATED_FRAME = 'server: frame truncated';
+
+// And an args length that would make the request larger than the frame limit,
+// checked before truncation. Since v0.7.0-beta6 at the latest the bound is on
+// the op header plus the args (`server.DecodeRequest`); v0.6.0 compared the
+// args length alone, so the two differ only within an op header's width of
+// 16 MiB. This follows the newer rule.
+const FRAME_TOO_LARGE = 'server: frame too large';
+
+// server.MaxFrameSize: v0.5.0 through v0.7.0-beta7.
+const MAX_FRAME_BODY = 16 * 1024 * 1024;
 
 $server = stream_socket_server('tcp://127.0.0.1:0', $errorNumber, $errorMessage);
 
@@ -64,22 +92,67 @@ flush();
 
 /** @var array<int, resource> $clients */
 $clients = [];
-/** @var array<int, string> $buffers */
+/** @var array<int, string> $buffers bytes read and not yet framed */
 $buffers = [];
+/** @var array<int, string> $outgoing answers not yet written */
+$outgoing = [];
 /** @var array<int, int> $served */
 $served = [];
+/** @var array<int, true> $closeWhenFlushed */
+$closeWhenFlushed = [];
 /** @var array<string, array{value: string, expires: float|null}> $store */
 $store = [];
+
+$drop = static function (int $id) use (&$clients, &$buffers, &$outgoing, &$served, &$closeWhenFlushed): void {
+    fclose($clients[$id]);
+    unset($clients[$id], $buffers[$id], $outgoing[$id], $served[$id], $closeWhenFlushed[$id]);
+};
+
+// Answers are buffered and written as the socket takes them, the way a real
+// server writes. The stub used to hand each answer to fwrite() once and ignore
+// how much went: on a non-blocking socket a large answer - a getMany of 1100
+// values of 16 KiB is 17 MiB - went out in part, the rest was dropped, and the
+// client waited for bytes that were never coming.
+$send = static function (int $id) use (&$clients, &$outgoing, &$closeWhenFlushed, $drop): void {
+    if ($outgoing[$id] !== '') {
+        $written = @fwrite($clients[$id], $outgoing[$id]);
+
+        if ($written === false) {
+            $drop($id);
+
+            return;
+        }
+
+        $outgoing[$id] = (string) substr($outgoing[$id], $written);
+    }
+
+    if ($outgoing[$id] === '' && isset($closeWhenFlushed[$id])) {
+        $drop($id);
+    }
+};
 
 $deadline = microtime(true) + $lifetime;
 
 while (microtime(true) < $deadline) {
     $read = array_merge([$server], array_values($clients));
-    $write = null;
+    $write = [];
+
+    foreach ($outgoing as $id => $pending) {
+        if ($pending !== '') {
+            $write[] = $clients[$id];
+        }
+    }
+
     $except = null;
 
     if (@stream_select($read, $write, $except, 0, 200_000) === false) {
         continue;
+    }
+
+    foreach ($write as $stream) {
+        if (isset($clients[(int) $stream])) {
+            $send((int) $stream);
+        }
     }
 
     foreach ($read as $stream) {
@@ -91,6 +164,7 @@ while (microtime(true) < $deadline) {
                 $id = (int) $client;
                 $clients[$id] = $client;
                 $buffers[$id] = '';
+                $outgoing[$id] = '';
                 $served[$id] = 0;
             }
 
@@ -98,20 +172,35 @@ while (microtime(true) < $deadline) {
         }
 
         $id = (int) $stream;
+
+        if (! isset($clients[$id])) {
+            continue;
+        }
+
         $chunk = @fread($stream, 65536);
 
         if ($chunk === false || ($chunk === '' && feof($stream))) {
-            fclose($stream);
-            unset($clients[$id], $buffers[$id], $served[$id]);
+            $drop($id);
 
             continue;
         }
 
         $buffers[$id] .= $chunk;
-        $closing = false;
 
-        while (strlen($buffers[$id]) >= 4) {
+        while (strlen($buffers[$id]) >= 4 && ! isset($closeWhenFlushed[$id])) {
             $length = unpack('N', substr($buffers[$id], 0, 4))[1];
+
+            // The real server's own bound, on the length prefix alone: an empty
+            // body or one over 16 MiB is not answered, the connection is closed.
+            // A fake that read any size would let a client send what no rostam
+            // will read and pass. Answers to the frames before it still go out
+            // first, as they do from v0.6.0 through v0.7.0-beta7.
+            if ($length === 0 || $length > MAX_FRAME_BODY) {
+                $buffers[$id] = '';
+                $closeWhenFlushed[$id] = true;
+
+                break;
+            }
 
             if (strlen($buffers[$id]) < 4 + $length) {
                 break;
@@ -120,21 +209,15 @@ while (microtime(true) < $deadline) {
             $body = substr($buffers[$id], 4, $length);
             $buffers[$id] = substr($buffers[$id], 4 + $length);
 
-            fwrite($stream, respond($body, $token, $legacy, $store));
-
+            $outgoing[$id] .= respond($body, $token, $legacy, $store);
             $served[$id]++;
 
             if ($dropAfter > 0 && $served[$id] >= $dropAfter) {
-                $closing = true;
-
-                break;
+                $closeWhenFlushed[$id] = true;
             }
         }
 
-        if ($closing) {
-            fclose($stream);
-            unset($clients[$id], $buffers[$id], $served[$id]);
-        }
+        $send($id);
     }
 }
 
@@ -149,21 +232,24 @@ fclose($server);
  */
 function respond(string $body, string $token, bool $legacy, array &$store): string
 {
-    // Outside the try below on purpose no longer: a header pointing past the
-    // end of the body used to raise here and take the process with it, which is
-    // one thing the real server never does.
+    // Guarded on its own: a header pointing past the end of the body used to
+    // raise here, outside any guard, and take the whole process with it - one
+    // thing the real server never does.
     try {
         [$op, $args, $sent] = decodeBody($body);
+    } catch (OverflowException) {
+        return errorFrame(FRAME_TOO_LARGE);
     } catch (Throwable) {
-        return frame(3, TRUNCATED_FRAME);
+        return errorFrame(TRUNCATED_FRAME);
     }
 
+    // No reason given: rostam answers a refused token with an empty payload.
     if ($token !== '' && $sent !== $token) {
-        return frame(4, 'invalid token');
+        return frame(4, '');
     }
 
     if ($legacy && in_array($op, MODERN_OPS, true)) {
-        return frame(3, GENERIC_ERROR);
+        return errorFrame(GENERIC_ERROR);
     }
 
     // Args this fake cannot decode reach `unpack` short and raise. rostam does
@@ -173,7 +259,7 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
     try {
         return dispatch($op, $args, $store);
     } catch (Throwable) {
-        return frame(3, GENERIC_ERROR);
+        return errorFrame(GENERIC_ERROR);
     }
 }
 
@@ -216,6 +302,31 @@ function dispatch(string $op, string $args, array &$store): string
             $store = [];
 
             return frame(0, '');
+
+        case 'put_batch':
+            // Decoded in full before anything is applied, as the real decoder
+            // does: a batch truncated at its last entry stores none of it.
+            [$count, $offset] = takeNumber($args, 0, 'N', 4);
+            $entries = [];
+
+            for ($i = 0; $i < $count; $i++) {
+                [$key, $value, $ttl] = decodeValueArgs(substr($args, $offset));
+                $entries[] = [$key, $value, $ttl];
+                $offset += 2 + strlen($key) + 4 + strlen($value) + 8;
+            }
+
+            foreach ($entries as [$key, $value, $ttl]) {
+                $store[$key] = ['value' => $value, 'expires' => deadlineFor($ttl)];
+            }
+
+            return frame(0, pack('N', count($entries)));
+
+        case '__repl_metrics__':
+            // A single node, and what a replicating one would say instead.
+            return frame(0, REPLICATED ? '{"shards":[{"shard":0,"mode":"raft","isr":3}]}' : '{"shards":[]}');
+
+        case '__kv_metrics__':
+            return frame(0, kvMetricsText($store));
 
         case 'get':
             $entry = live($store, decodeKey($args));
@@ -349,7 +460,7 @@ function dispatch(string $op, string $args, array &$store): string
             $entry = live($store, $key);
 
             if ($entry !== null && strlen($entry['value']) !== 8) {
-                return frame(3, GENERIC_ERROR);
+                return errorFrame(GENERIC_ERROR);
             }
 
             $next = ($entry === null ? 0 : unpack('J', $entry['value'])[1]) + $delta;
@@ -364,7 +475,7 @@ function dispatch(string $op, string $args, array &$store): string
             return frame(0, pack('J', $next));
     }
 
-    return frame(3, GENERIC_ERROR);
+    return errorFrame(GENERIC_ERROR);
 }
 
 function deadlineFor(int $ttlMilliseconds): ?float
@@ -375,6 +486,37 @@ function deadlineFor(int $ttlMilliseconds): ?float
 function foundValue(?string $value): string
 {
     return $value === null ? "\x00" : "\x01".pack('N', strlen($value)).$value;
+}
+
+/**
+ * Only the counters this fake can report truthfully.
+ *
+ * A real server reports some thirty-five - reads, hits, relocations, page
+ * geometry - and a fake inventing plausible values for those would let a test
+ * lean on numbers no server produced. These four it genuinely knows: how many
+ * keys it holds, that it never evicts or refuses on its own, and whatever
+ * live-eviction count a test told it to claim. The format - HELP and TYPE
+ * lines before each sample - is the real server's, so a parser meets the same
+ * shape here as there.
+ *
+ * @param  array<string, array{value: string, expires: float|null}>  $store
+ */
+function kvMetricsText(array $store): string
+{
+    $metrics = [
+        ['rostam_kv_evictions_total', 'counter', 'entries displaced by ringbuf eviction, live or already superseded', LIVE_EVICTIONS],
+        ['rostam_kv_evictions_live_total', 'counter', 'entries displaced by ringbuf eviction that were still the live record for their key', LIVE_EVICTIONS],
+        ['rostam_kv_rejects_total', 'counter', 'writes refused under PolicyRejectWrites', 0],
+        ['rostam_kv_entries', 'gauge', 'keys currently held in the index', count($store)],
+    ];
+
+    $text = '';
+
+    foreach ($metrics as [$name, $type, $help, $value]) {
+        $text .= "# HELP {$name} {$help}\n# TYPE {$name} {$type}\n{$name} {$value}\n";
+    }
+
+    return $text;
 }
 
 /**
@@ -442,6 +584,12 @@ function decodeBody(string $body): array
     $op = take($body, $offset + 1, $opLength);
     [$argsLength, $argsOffset] = takeNumber($body, $offset + 1 + $opLength, 'N', 4);
 
+    // Before truncation, as the server orders them. The header counted is the
+    // v1 body's own - the token prefix of a v2 frame is not part of it.
+    if (1 + $opLength + 4 + $argsLength > MAX_FRAME_BODY) {
+        throw new OverflowException(FRAME_TOO_LARGE);
+    }
+
     return [$op, take($body, $argsOffset, $argsLength), $sentToken];
 }
 
@@ -476,4 +624,15 @@ function live(array &$store, string $key): ?array
 function frame(int $status, string $payload): string
 {
     return pack('N', 5 + strlen($payload)).chr($status).pack('N', strlen($payload)).$payload;
+}
+
+/**
+ * An ERROR answer, carrying its text the way rostam does: [textLen u16][text].
+ * This stub used to send the bare text, which is kinder than the server - a
+ * client that forgot the prefix passed here and put a NUL into every real
+ * exception message.
+ */
+function errorFrame(string $message): string
+{
+    return frame(3, pack('n', strlen($message)).$message);
 }

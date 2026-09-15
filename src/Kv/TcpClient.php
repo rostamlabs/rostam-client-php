@@ -6,13 +6,20 @@ declare(strict_types=1);
 namespace Rostam\Kv;
 
 use Rostam\Contracts\KvClient;
+use Rostam\Contracts\ReportsKvMetrics;
 use Rostam\Exceptions\ConnectionException;
+use Rostam\Exceptions\ProtocolException;
+use Rostam\Exceptions\RostamException;
 use Rostam\Exceptions\ServerException;
 use Rostam\Exceptions\StaleConnectionException;
+use Rostam\Exceptions\TopologyMismatchException;
+use Rostam\Kv\Metrics\KvMetrics;
 use Rostam\Kv\Protocol\Connection;
 use Rostam\Kv\Protocol\ConnectionConfig;
 use Rostam\Kv\Protocol\ConnectionPool;
 use Rostam\Kv\Protocol\Response;
+use Rostam\Kv\Protocol\Status;
+use Rostam\Kv\Protocol\Topology;
 use Rostam\Kv\Protocol\Wire;
 use Rostam\TimeUnit;
 use Throwable;
@@ -22,11 +29,24 @@ use Throwable;
  *
  * Batch methods pipeline: every frame goes out in one write and the answers are
  * read back in request order (the server answers a connection strictly FIFO),
- * so `many()` of 50 keys costs one round trip rather than fifty.
+ * so `many()` of 50 keys costs one round trip rather than fifty. The one
+ * exception is {@see putMany()} on a connection declared single-node, which
+ * sends `put_batch` frames instead - still in one round trip.
  */
-class TcpClient implements KvClient
+class TcpClient implements KvClient, ReportsKvMetrics
 {
+    /**
+     * What a put_batch body costs beyond its entries, at its largest: the v2
+     * marker, token length and a 255-byte token, the op name's length and a
+     * 255-byte name, the args length, and the entry count. MAX_FRAME bounds the
+     * body, so the four-byte length prefix in front of it is not counted.
+     */
+    private const PUT_BATCH_FRAME_OVERHEAD = 1 + 1 + 255 + 1 + 255 + 4 + 4;
+
     protected ConnectionPool $pool;
+
+    /** Whether a single-node declaration has been checked against this server. */
+    protected bool $topologyChecked = false;
 
     public function __construct(protected readonly ConnectionConfig $config, ?ConnectionPool $pool = null)
     {
@@ -80,6 +100,26 @@ class TcpClient implements KvClient
         $this->call(new Command(Wire::OP_PUT, Wire::putArgs($key, $value, $unit->toMilliseconds($ttl))));
     }
 
+    /**
+     * One round trip for many puts.
+     *
+     * By default every entry is its own `put` in one pipeline, routed per key -
+     * correct on any topology. On a connection declared
+     * `topology => single-node` the entries go as `put_batch` instead, about an
+     * order of magnitude faster (4000 entries: 48 ms pipelined, 3.6 ms batched,
+     * measured on v0.7.0-beta6). The batch op routes by its first key, which is
+     * why it waits for that declaration; see {@see Topology}.
+     *
+     * Neither path is a transaction, and a failure does not stop at the entry
+     * that failed. The server skips an entry it cannot store and applies the
+     * rest of the batch - measured on v0.7.0-beta6: a batch of `[a, a value too
+     * large to store, b]` answered an error and both `a` and `b` read back - and
+     * every other single put in a pipeline lands as well. So after an error any
+     * entry may have landed. Writing the same call again is safe: a put is
+     * last-writer-wins.
+     *
+     * @throws TopologyMismatchException when a single-node declaration meets a replicating server
+     */
     public function putMany(array $entries, TimeUnit $unit = TimeUnit::Seconds): void
     {
         $entries = array_values($entries);
@@ -88,13 +128,143 @@ class TcpClient implements KvClient
             return;
         }
 
+        $entries = array_map(
+            static fn (array $entry) => [$entry[0], $entry[1], $unit->toMilliseconds($entry[2] ?? 0)],
+            $entries
+        );
+
+        if ($this->config->topology === Topology::SingleNode) {
+            $this->putBatched($entries);
+
+            return;
+        }
+
         $this->pipeline(array_map(
-            static fn (array $entry) => new Command(
-                Wire::OP_PUT,
-                Wire::putArgs($entry[0], $entry[1], $unit->toMilliseconds($entry[2] ?? 0))
-            ),
+            static fn (array $entry) => new Command(Wire::OP_PUT, Wire::putArgs(...$entry)),
             $entries
         ));
+    }
+
+    public function kvMetrics(): KvMetrics
+    {
+        $response = $this->call(new Command(Wire::OP_KV_METRICS, '', idempotent: true));
+
+        return KvMetrics::fromPrometheusText($response->payload);
+    }
+
+    /**
+     * @param  list<array{0: string, 1: string, 2: int}>  $entries  key, value, TTL in milliseconds
+     */
+    protected function putBatched(array $entries): void
+    {
+        $this->assertNotReplicated();
+
+        $chunks = self::chunkForBatch($entries, Wire::MAX_FRAME - self::PUT_BATCH_FRAME_OVERHEAD);
+
+        $responses = $this->pipeline(array_map(
+            static fn (array $chunk) => new Command(Wire::OP_PUT_BATCH, Wire::putBatchArgs($chunk)),
+            $chunks
+        ));
+
+        // On success the server always reports every entry applied - it skips
+        // a failing one and answers an error instead - so this is not a state
+        // it is known to produce. It is a check on the answer itself: a count
+        // that does not add up is not something to return past as if it did.
+        foreach ($responses as $index => $response) {
+            $applied = Wire::decodePutBatchResult($response->payload);
+
+            if ($applied !== count($chunks[$index])) {
+                throw new RostamException(sprintf(
+                    'put_batch applied %d of the %d entries it was sent',
+                    $applied,
+                    count($chunks[$index]),
+                ));
+            }
+        }
+    }
+
+    /**
+     * Split entries into batches the server will accept.
+     *
+     * Twice over: at MAX_PUT_BATCH_ENTRIES, the size the server's own clients
+     * split at, and at the byte budget the frame limit leaves - the server
+     * drops the connection on a body over 16 MiB, which 1100 entries of 16 KiB
+     * already are. Order is kept, so a key written twice in one call keeps its
+     * last value. An entry too large for any frame goes alone, and the frame
+     * encoder refuses it exactly as it would a single put.
+     *
+     * @param  list<array{0: string, 1: string, 2: int}>  $entries
+     * @return list<list<array{0: string, 1: string, 2: int}>>
+     */
+    public static function chunkForBatch(array $entries, int $byteBudget): array
+    {
+        $chunks = [];
+        $chunk = [];
+        $bytes = 0;
+
+        foreach ($entries as $entry) {
+            $size = 2 + strlen($entry[0]) + 4 + strlen($entry[1]) + 8;
+
+            if ($chunk !== [] && (count($chunk) === Wire::MAX_PUT_BATCH_ENTRIES || $bytes + $size > $byteBudget)) {
+                $chunks[] = $chunk;
+                $chunk = [];
+                $bytes = 0;
+            }
+
+            $chunk[] = $entry;
+            $bytes += $size;
+        }
+
+        if ($chunk !== []) {
+            $chunks[] = $chunk;
+        }
+
+        return $chunks;
+    }
+
+    /**
+     * Refuse a single-node declaration the server can prove wrong.
+     *
+     * Checked before the first batch is written, and remembered only once it
+     * has been answered. A non-empty shard list is replication, and replication
+     * is exactly where a batch routed by its first key strands the rest. An
+     * empty one proves nothing - a cluster member hosting no shards says the
+     * same - so it is taken as agreement with the declaration, not as
+     * confirmation of it.
+     *
+     * Any failure to answer is thrown, and not remembered. `__repl_metrics__`
+     * exists in every release this client supports, so no error from it means
+     * "this server cannot say" - it means the check did not happen, whether a
+     * refused token, a dropped connection, or the generic error that could be
+     * anything. Taking any of those as agreement would let a batch reach a
+     * cluster on the strength of a question nobody answered.
+     *
+     * @throws TopologyMismatchException
+     */
+    protected function assertNotReplicated(): void
+    {
+        if ($this->topologyChecked) {
+            return;
+        }
+
+        $response = $this->call(new Command(Wire::OP_REPL_METRICS, '', idempotent: true));
+
+        $report = json_decode($response->payload, true);
+
+        if (! is_array($report) || ! array_key_exists('shards', $report) || ! is_array($report['shards'])) {
+            throw new ProtocolException('__repl_metrics__ did not answer with a shard list: '.substr($response->payload, 0, 200));
+        }
+
+        if ($report['shards'] !== []) {
+            throw new TopologyMismatchException(sprintf(
+                'this connection is declared single-node, but the server reports %d replicated shard(s). '
+                .'put_batch is routed by its first key, so on a cluster every key another shard owns would be '
+                .'stored where no read looks for it. Remove the declaration to write through per-key puts.',
+                count($report['shards']),
+            ));
+        }
+
+        $this->topologyChecked = true;
     }
 
     public function setNx(string $key, string $value, int $ttl = 0, TimeUnit $unit = TimeUnit::Seconds): bool
@@ -367,19 +537,26 @@ class TcpClient implements KvClient
 
             // There used to be a check here that turned a generic error into
             // "your server is too old". It could not work and never fired.
-            // Measured against v0.4.2 and v0.6.0, the server answers a byte-
-            // identical `internal error` to all three of:
+            // Measured against v0.4.2, v0.6.0 and v0.7.0-beta6, the server
+            // answers a byte-identical `internal error` to all three of:
             //
             //     an op it does not know          (a server that is too old)
             //     args it could not decode        (a bug in this client)
             //     incr_ex on a non-counter key    (an ordinary application miss)
             //
             // Nothing in the response separates them, and there is no version
-            // or capability op to ask instead. A guess would have been worse
+            // or capability op to ask instead - `__kv_metrics__` reports what
+            // the cache has done, not what the server can do. (v0.7.0's
+            // `kv_query` does name its own argument errors; the ops this
+            // client sends still do not.) A guess would have been worse
             // than silence: reading the third as the first would have turned
             // Laravel's `increment()` on a non-numeric key from `false` into a
             // thrown exception.
-            throw new ServerException($response->status, $response->payload, $commands[$index]->op);
+            $detail = in_array($response->status, [Status::ERROR, Status::NOT_LEADER], true)
+                ? Wire::decodeErrorText($response->payload)
+                : $response->payload;
+
+            throw new ServerException($response->status, $detail, $commands[$index]->op);
         }
 
         return $responses;
