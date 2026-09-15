@@ -45,12 +45,43 @@ class PutBatchTest extends TestCase
         );
     }
 
-    public function test_it_refuses_more_than_the_server_accepts_in_one_batch(): void
+    /**
+     * Not a server limit - a 4097-entry batch applied in full on v0.7.0-beta6 -
+     * but the size the server's own clients split at, and this one refuses to
+     * build a batch it would itself have split.
+     */
+    public function test_it_refuses_to_build_a_batch_past_the_split_size(): void
     {
         $this->expectException(ProtocolException::class);
-        $this->expectExceptionMessageMatches('/at most 4096 entries, got 4097/');
+        $this->expectExceptionMessageMatches('/split at 4096 entries here, got 4097/');
 
         Wire::putBatchArgs(array_fill(0, Wire::MAX_PUT_BATCH_ENTRIES + 1, ['k', 'v', 0]));
+    }
+
+    /**
+     * `server.MaxFrameSize` bounds the body, and the server does not answer a
+     * body over it - it drops the connection. Refusing here gives the caller a
+     * reason instead of a dead socket.
+     */
+    public function test_a_body_over_sixteen_mebibytes_is_refused_before_it_is_sent(): void
+    {
+        $this->assertSame(16 * 1024 * 1024, Wire::MAX_FRAME);
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessageMatches('/request body of \d+ bytes exceeds the server limit of 16777216/');
+
+        Wire::frame(Wire::OP_PUT, Wire::putArgs('k', str_repeat('v', Wire::MAX_FRAME)));
+    }
+
+    /** The bound is on the body alone, exactly as the server reads it: a body of exactly 16 MiB is allowed. */
+    public function test_a_body_of_exactly_sixteen_mebibytes_is_allowed(): void
+    {
+        $op = Wire::OP_PUT;
+        $overhead = 1 + strlen($op) + 4;
+
+        $frame = Wire::frame($op, str_repeat('a', Wire::MAX_FRAME - $overhead));
+
+        $this->assertSame(Wire::MAX_FRAME, unpack('N', substr($frame, 0, 4))[1]);
     }
 
     public function test_the_answer_is_a_four_byte_count(): void

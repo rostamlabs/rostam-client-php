@@ -99,20 +99,44 @@ jobs:
       - name: Fetch rostam-server (${{ matrix.channel }})
         env:
           GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ matrix.channel }}
         run: |
           set -euo pipefail
-          if [ "${{ matrix.channel }}" = "stable" ]; then
-            api="https://api.github.com/repos/rostamlabs/rostam/releases/latest"
-          else
-            api="https://api.github.com/repos/rostamlabs/rostam/releases?per_page=1"
-          fi
-          url=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
-            | grep -o 'https://[^"]*linux_amd64\.tar\.gz' | head -n1)
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/rostamlabs/rostam/releases?per_page=50" -o releases.json
+
+          # The HIGHEST version, not the newest by date. Picking by date, a patch
+          # published after a beta would hand the pre-release lane a stable
+          # server, and every beta-only test would skip without failing. Stable
+          # takes the highest release that is not a pre-release.
+          url=$(php -r '
+            $best = null;
+            foreach (json_decode(file_get_contents("releases.json"), true) as $release) {
+                if ($release["draft"] || (getenv("CHANNEL") === "stable" && $release["prerelease"])) {
+                    continue;
+                }
+                foreach ($release["assets"] as $asset) {
+                    if (str_ends_with($asset["name"], "linux_amd64.tar.gz")
+                        && ($best === null || version_compare(ltrim($release["tag_name"], "v"), ltrim($best[0], "v"), ">"))) {
+                        $best = [$release["tag_name"], $asset["browser_download_url"]];
+                    }
+                }
+            }
+            if ($best === null) { fwrite(STDERR, "no linux_amd64 release to test against\n"); exit(1); }
+            echo $best[1];
+          ')
           echo "downloading $url"
           curl -fsSL "$url" -o rostam.tar.gz
           tar xzf rostam.tar.gz
-          # "rostam-server 0.7.0-beta6 (go1.26.5 linux/amd64)" -> 0.7.0-beta6
+
+          # "rostam-server 0.7.0-beta6 (go1.26.5 linux/amd64)" -> 0.7.0-beta6.
+          # A version that does not read as one fails the job: tests gate on it,
+          # and a garbled one would make every newer-op test skip in silence.
           version=$(./rostam-server --version | awk '{print $2}')
+          if ! printf '%s' "$version" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::could not read a version from: $(./rostam-server --version)"
+            exit 1
+          fi
           echo "rostam-server $version"
           echo "ROSTAM_TEST_SERVER_VERSION=$version" >> "$GITHUB_ENV"
 

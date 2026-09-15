@@ -75,6 +75,59 @@ class KvMetricsTest extends TestCase
         $this->assertSame(['' => 10, '{shard="0"}' => 4, '{shard="1"}' => 6], $metrics->series(KvMetrics::ENTRIES));
     }
 
+    /**
+     * `{}` is an unlabelled sample written with braces. Reading it as a separate
+     * series left get() answering null for a metric the server did report -
+     * the exact mistake this class exists to prevent.
+     */
+    public function test_empty_braces_are_the_unlabelled_sample(): void
+    {
+        $metrics = KvMetrics::fromPrometheusText(KvMetrics::EVICTIONS_LIVE."{} 5\n");
+
+        $this->assertSame(5, $metrics->evictionsLive());
+    }
+
+    /** A label value is a quoted string: a brace, a comma or an escaped quote inside it is data. */
+    public function test_a_label_value_may_hold_braces_commas_and_escaped_quotes(): void
+    {
+        $metrics = KvMetrics::fromPrometheusText(
+            'rostam_kv_entries{path="a}b,c",note="say \"hi\"",} 7'."\n"
+        );
+
+        $this->assertSame(['{note="say \"hi\"",path="a}b,c"}' => 7], $metrics->series(KvMetrics::ENTRIES));
+    }
+
+    /** The same series in another label order is the same series, and a repeat is still refused. */
+    public function test_a_series_repeated_in_another_label_order_is_refused(): void
+    {
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessageMatches('/repeats the series/');
+
+        KvMetrics::fromPrometheusText("rostam_kv_entries{a=\"1\",b=\"2\"} 1\nrostam_kv_entries{b=\"2\",a=\"1\"} 2\n");
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function malformedLabelSets(): array
+    {
+        return [
+            'an unclosed value' => ['rostam_kv_entries{a="1} 5'],
+            'no quotes' => ['rostam_kv_entries{a=1} 5'],
+            'no separator' => ['rostam_kv_entries{a="1" b="2"} 5'],
+            'the same label twice' => ['rostam_kv_entries{a="1",a="2"} 5'],
+            'an unknown escape' => ['rostam_kv_entries{a="\q"} 5'],
+        ];
+    }
+
+    #[DataProvider('malformedLabelSets')]
+    public function test_a_label_set_it_cannot_read_is_refused(string $line): void
+    {
+        $this->expectException(ProtocolException::class);
+
+        KvMetrics::fromPrometheusText($line."\n");
+    }
+
     public function test_a_trailing_timestamp_is_allowed(): void
     {
         $this->assertSame(5, KvMetrics::fromPrometheusText("rostam_kv_rejects_total 5 1726412345000\n")->rejects());

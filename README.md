@@ -158,13 +158,36 @@ That is a **declaration, not a detection**, and the wire can only disprove it.
 Before the first batch the client asks for `__repl_metrics__`: a non-empty shard
 list is replication, and it throws `TopologyMismatchException` without writing
 anything. An empty list proves nothing — a cluster member hosting no shards
-answers the same — so it is taken as agreement, not confirmation. A server that
-*refuses* the question (a scoped key, say) is not taken as agreement either.
+answers the same — so it is taken as agreement, not confirmation. **Any error from
+that question is thrown and not remembered**: the op exists in every release this
+client supports, so an error never means "this server cannot say", and nothing is
+written on the strength of a question nobody answered.
 
-Batches are split at the server's cap of 4096 entries and at the frame limit, and
-all of them still go out in one round trip. Neither path is a transaction: a
-failure part-way leaves the earlier entries applied. A batch the server applied
-short of what it was sent throws rather than returning as though every key landed.
+Batches are split at 4096 entries — the size the server's own clients split at;
+the server does not refuse more — and at the 16 MiB body limit, and all of them
+still go out in one round trip.
+
+**Neither path is a transaction, and a failure does not stop at the entry that
+failed.** The server skips an entry it cannot store and applies the rest: on
+v0.7.0-beta6, a batch of `[a, <a value too large to store>, b]` answered an error
+and both `a` and `b` read back. A pipeline of single puts behaves the same. After
+an error, any entry may have landed; writing the same call again is safe, since a
+put is last-writer-wins.
+
+## How large a value can be
+
+Two limits, and the second is usually the one you meet.
+
+- **The frame: 16 MiB.** `server.MaxFrameSize` bounds every request body, from
+  v0.5.0 through v0.7.0-beta6. The server does not answer a body over it — it
+  drops the connection — so this client refuses to send one and throws a
+  `ProtocolException` with the reason. (Before v0.3.0 it assumed 64 MiB.)
+- **The cache page.** A value has to fit in one page of the server's cache, and the
+  page size follows from `max_memory` divided across the shards. On a default
+  single-node server that is far below the frame limit: the largest value stored
+  was **about 1 MiB** (1,048,544 bytes on v0.6.0, 1,048,540 on v0.7.0-beta6, on the
+  same machine). A value over it answers the generic `internal error`. Fewer
+  shards or a larger `max_memory` raise it.
 
 ## Metrics
 

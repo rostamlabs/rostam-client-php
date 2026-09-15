@@ -18,7 +18,6 @@ use Rostam\Kv\Protocol\Connection;
 use Rostam\Kv\Protocol\ConnectionConfig;
 use Rostam\Kv\Protocol\ConnectionPool;
 use Rostam\Kv\Protocol\Response;
-use Rostam\Kv\Protocol\Status;
 use Rostam\Kv\Protocol\Topology;
 use Rostam\Kv\Protocol\Wire;
 use Rostam\TimeUnit;
@@ -36,10 +35,12 @@ use Throwable;
 class TcpClient implements KvClient, ReportsKvMetrics
 {
     /**
-     * What a put_batch frame costs beyond its entries: the frame and body length
-     * prefixes, the op name, a v2 auth header at its largest, and the count.
+     * What a put_batch body costs beyond its entries, at its largest: the v2
+     * marker, token length and a 255-byte token, the op name's length and a
+     * 255-byte name, the args length, and the entry count. MAX_FRAME bounds the
+     * body, so the four-byte length prefix in front of it is not counted.
      */
-    private const PUT_BATCH_FRAME_OVERHEAD = 4 + 1 + 255 + 4 + 2 + 255 + 4;
+    private const PUT_BATCH_FRAME_OVERHEAD = 1 + 1 + 255 + 1 + 255 + 4 + 4;
 
     protected ConnectionPool $pool;
 
@@ -108,8 +109,13 @@ class TcpClient implements KvClient, ReportsKvMetrics
      * measured on v0.7.0-beta6). The batch op routes by its first key, which is
      * why it waits for that declaration; see {@see Topology}.
      *
-     * Neither path is a transaction. A failure part-way leaves the entries
-     * before it applied, the same as a pipeline of single puts would.
+     * Neither path is a transaction, and a failure does not stop at the entry
+     * that failed. The server skips an entry it cannot store and applies the
+     * rest of the batch - measured on v0.7.0-beta6: a batch of `[a, a value too
+     * large to store, b]` answered an error and both `a` and `b` read back - and
+     * every other single put in a pipeline lands as well. So after an error any
+     * entry may have landed. Writing the same call again is safe: a put is
+     * last-writer-wins.
      *
      * @throws TopologyMismatchException when a single-node declaration meets a replicating server
      */
@@ -159,6 +165,10 @@ class TcpClient implements KvClient, ReportsKvMetrics
             $chunks
         ));
 
+        // On success the server always reports every entry applied - it skips
+        // a failing one and answers an error instead - so this is not a state
+        // it is known to produce. It is a check on the answer itself: a count
+        // that does not add up is not something to return past as if it did.
         foreach ($responses as $index => $response) {
             $applied = Wire::decodePutBatchResult($response->payload);
 
@@ -175,11 +185,12 @@ class TcpClient implements KvClient, ReportsKvMetrics
     /**
      * Split entries into batches the server will accept.
      *
-     * Twice over: the server caps a batch at MAX_PUT_BATCH_ENTRIES, and the
-     * frame carrying it at MAX_FRAME - 4096 entries of a megabyte each are four
-     * gigabytes, well past the second. Order is kept, so a key written twice in
-     * one call keeps its last value. An entry too large for any frame goes
-     * alone, and the frame encoder refuses it exactly as it would a single put.
+     * Twice over: at MAX_PUT_BATCH_ENTRIES, the size the server's own clients
+     * split at, and at the byte budget the frame limit leaves - the server
+     * drops the connection on a body over 16 MiB, which 1100 entries of 16 KiB
+     * already are. Order is kept, so a key written twice in one call keeps its
+     * last value. An entry too large for any frame goes alone, and the frame
+     * encoder refuses it exactly as it would a single put.
      *
      * @param  list<array{0: string, 1: string, 2: int}>  $entries
      * @return list<list<array{0: string, 1: string, 2: int}>>
@@ -213,11 +224,19 @@ class TcpClient implements KvClient, ReportsKvMetrics
     /**
      * Refuse a single-node declaration the server can prove wrong.
      *
-     * Checked once per client, before the first batch is written. A non-empty
-     * shard list is replication, and replication is exactly where a batch
-     * routed by its first key strands the rest. An empty one proves nothing -
-     * a cluster member hosting no shards says the same - so it is taken as
-     * agreement with the declaration, not as confirmation of it.
+     * Checked before the first batch is written, and remembered only once it
+     * has been answered. A non-empty shard list is replication, and replication
+     * is exactly where a batch routed by its first key strands the rest. An
+     * empty one proves nothing - a cluster member hosting no shards says the
+     * same - so it is taken as agreement with the declaration, not as
+     * confirmation of it.
+     *
+     * Any failure to answer is thrown, and not remembered. `__repl_metrics__`
+     * exists in every release this client supports, so no error from it means
+     * "this server cannot say" - it means the check did not happen, whether a
+     * refused token, a dropped connection, or the generic error that could be
+     * anything. Taking any of those as agreement would let a batch reach a
+     * cluster on the strength of a question nobody answered.
      *
      * @throws TopologyMismatchException
      */
@@ -227,22 +246,7 @@ class TcpClient implements KvClient, ReportsKvMetrics
             return;
         }
 
-        try {
-            $response = $this->call(new Command(Wire::OP_REPL_METRICS, '', idempotent: true));
-        } catch (ServerException $exception) {
-            // Only the generic error means the server cannot answer - an op it
-            // has never heard of - and a server that cannot answer cannot
-            // contradict the declaration either. Anything else is a refusal to
-            // answer, and on a cluster with scoped keys that refusal is exactly
-            // where a batch would go wrong. So it is not taken as agreement.
-            if ($exception->status !== Status::ERROR) {
-                throw $exception;
-            }
-
-            $this->topologyChecked = true;
-
-            return;
-        }
+        $response = $this->call(new Command(Wire::OP_REPL_METRICS, '', idempotent: true));
 
         $report = json_decode($response->payload, true);
 

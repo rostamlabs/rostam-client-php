@@ -19,7 +19,11 @@ declare(strict_types=1);
  *   - with one exception, a layer lower: a frame whose header points past the
  *     end of what arrived is named, `server: frame truncated`. Both were
  *     measured against a real v0.6.0 and again on v0.7.0-beta6, and neither
- *     closes the connection.
+ *     closes the connection;
+ *   - a length prefix of zero or over 16 MiB (`server.MaxFrameSize`) is not
+ *     answered at all: the connection is closed, as the server closes it;
+ *   - answers are buffered and written as the socket accepts them, so a large
+ *     pipelined answer arrives whole, as it does from the server.
  *
  * Run as: php server.php [--token=...] [--drop-after=N] [--lifetime=SECONDS]
  *                        [--legacy] [--replicated] [--live-evictions=N]
@@ -62,6 +66,9 @@ const GENERIC_ERROR = 'internal error';
 // args length belongs answers `server: frame truncated`, not `internal error`.
 const TRUNCATED_FRAME = 'server: frame truncated';
 
+// server.MaxFrameSize: v0.5.0 through v0.7.0-beta6.
+const MAX_FRAME_BODY = 16 * 1024 * 1024;
+
 $server = stream_socket_server('tcp://127.0.0.1:0', $errorNumber, $errorMessage);
 
 if ($server === false) {
@@ -77,22 +84,67 @@ flush();
 
 /** @var array<int, resource> $clients */
 $clients = [];
-/** @var array<int, string> $buffers */
+/** @var array<int, string> $buffers bytes read and not yet framed */
 $buffers = [];
+/** @var array<int, string> $outgoing answers not yet written */
+$outgoing = [];
 /** @var array<int, int> $served */
 $served = [];
+/** @var array<int, true> $closeWhenFlushed */
+$closeWhenFlushed = [];
 /** @var array<string, array{value: string, expires: float|null}> $store */
 $store = [];
+
+$drop = static function (int $id) use (&$clients, &$buffers, &$outgoing, &$served, &$closeWhenFlushed): void {
+    fclose($clients[$id]);
+    unset($clients[$id], $buffers[$id], $outgoing[$id], $served[$id], $closeWhenFlushed[$id]);
+};
+
+// Answers are buffered and written as the socket takes them, the way a real
+// server writes. The stub used to hand each answer to fwrite() once and ignore
+// how much went: on a non-blocking socket a large answer - a getMany of 1100
+// values of 16 KiB is 17 MiB - went out in part, the rest was dropped, and the
+// client waited for bytes that were never coming.
+$send = static function (int $id) use (&$clients, &$outgoing, &$closeWhenFlushed, $drop): void {
+    if ($outgoing[$id] !== '') {
+        $written = @fwrite($clients[$id], $outgoing[$id]);
+
+        if ($written === false) {
+            $drop($id);
+
+            return;
+        }
+
+        $outgoing[$id] = (string) substr($outgoing[$id], $written);
+    }
+
+    if ($outgoing[$id] === '' && isset($closeWhenFlushed[$id])) {
+        $drop($id);
+    }
+};
 
 $deadline = microtime(true) + $lifetime;
 
 while (microtime(true) < $deadline) {
     $read = array_merge([$server], array_values($clients));
-    $write = null;
+    $write = [];
+
+    foreach ($outgoing as $id => $pending) {
+        if ($pending !== '') {
+            $write[] = $clients[$id];
+        }
+    }
+
     $except = null;
 
     if (@stream_select($read, $write, $except, 0, 200_000) === false) {
         continue;
+    }
+
+    foreach ($write as $stream) {
+        if (isset($clients[(int) $stream])) {
+            $send((int) $stream);
+        }
     }
 
     foreach ($read as $stream) {
@@ -104,6 +156,7 @@ while (microtime(true) < $deadline) {
                 $id = (int) $client;
                 $clients[$id] = $client;
                 $buffers[$id] = '';
+                $outgoing[$id] = '';
                 $served[$id] = 0;
             }
 
@@ -111,20 +164,33 @@ while (microtime(true) < $deadline) {
         }
 
         $id = (int) $stream;
+
+        if (! isset($clients[$id])) {
+            continue;
+        }
+
         $chunk = @fread($stream, 65536);
 
         if ($chunk === false || ($chunk === '' && feof($stream))) {
-            fclose($stream);
-            unset($clients[$id], $buffers[$id], $served[$id]);
+            $drop($id);
 
             continue;
         }
 
         $buffers[$id] .= $chunk;
-        $closing = false;
 
-        while (strlen($buffers[$id]) >= 4) {
+        while (strlen($buffers[$id]) >= 4 && ! isset($closeWhenFlushed[$id])) {
             $length = unpack('N', substr($buffers[$id], 0, 4))[1];
+
+            // The real server's own bound, on the length prefix alone: an empty
+            // body or one over 16 MiB is not answered, the connection is closed.
+            // A fake that read any size would let a client send what no rostam
+            // will read and pass.
+            if ($length === 0 || $length > MAX_FRAME_BODY) {
+                $drop($id);
+
+                continue 2;
+            }
 
             if (strlen($buffers[$id]) < 4 + $length) {
                 break;
@@ -133,21 +199,15 @@ while (microtime(true) < $deadline) {
             $body = substr($buffers[$id], 4, $length);
             $buffers[$id] = substr($buffers[$id], 4 + $length);
 
-            fwrite($stream, respond($body, $token, $legacy, $store));
-
+            $outgoing[$id] .= respond($body, $token, $legacy, $store);
             $served[$id]++;
 
             if ($dropAfter > 0 && $served[$id] >= $dropAfter) {
-                $closing = true;
-
-                break;
+                $closeWhenFlushed[$id] = true;
             }
         }
 
-        if ($closing) {
-            fclose($stream);
-            unset($clients[$id], $buffers[$id], $served[$id]);
-        }
+        $send($id);
     }
 }
 
@@ -162,9 +222,9 @@ fclose($server);
  */
 function respond(string $body, string $token, bool $legacy, array &$store): string
 {
-    // Outside the try below on purpose no longer: a header pointing past the
-    // end of the body used to raise here and take the process with it, which is
-    // one thing the real server never does.
+    // Guarded on its own: a header pointing past the end of the body used to
+    // raise here, outside any guard, and take the whole process with it - one
+    // thing the real server never does.
     try {
         [$op, $args, $sent] = decodeBody($body);
     } catch (Throwable) {

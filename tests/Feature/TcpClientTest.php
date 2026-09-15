@@ -430,6 +430,41 @@ class TcpClientTest extends TestCase
         $this->assertTrue($client->ping());
     }
 
+    /**
+     * A body over `server.MaxFrameSize` is not answered at all: the server
+     * closes the connection on reading the length prefix. Asserted in both
+     * modes, which is what keeps the fake from reading a size the server would
+     * not - it used to read anything, and a client assuming 64 MiB passed.
+     *
+     * Only the prefix is sent. The server decides on the four bytes alone,
+     * so the test does not have to push sixteen megabytes to make its point.
+     */
+    public function test_a_body_over_sixteen_mebibytes_is_not_answered_the_connection_is_dropped(): void
+    {
+        $client = $this->client();
+
+        // A short timeout, so a server that waits for the body instead of
+        // refusing it shows up as a timeout rather than a slow pass.
+        $connection = new Connection(ConnectionConfig::fromArray($this->server->connectionConfig(['timeout' => 1.0])));
+        $connection->open();
+        $connection->write(pack('N', 16 * 1024 * 1024 + 1).chr(3).'put');
+
+        try {
+            $connection->readResponse();
+            $this->fail('a body over the frame limit was answered');
+        } catch (ConnectionException $exception) {
+            // Closed on the prefix, not left waiting for sixteen megabytes that
+            // are never coming. Both are ConnectionExceptions; only one is the
+            // server's behaviour.
+            $this->assertStringContainsString('closed by the server', $exception->getMessage());
+        } finally {
+            $connection->close();
+        }
+
+        // The server itself is unharmed.
+        $this->assertTrue($client->ping());
+    }
+
     /** Write bytes this client's own encoders would never produce. */
     private function sendRaw(string $frame): Response
     {

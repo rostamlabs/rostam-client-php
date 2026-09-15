@@ -42,8 +42,14 @@ use Rostam\Exceptions\ProtocolException;
  */
 final class Wire
 {
-    /** The server rejects any frame whose length prefix exceeds this. */
-    public const MAX_FRAME = 64 * 1024 * 1024;
+    /**
+     * The largest body - everything after the four-byte length prefix - the
+     * server accepts or sends: `server.MaxFrameSize`, 16 MiB, unchanged from
+     * v0.5.0 through v0.7.0-beta6. A request over it is not refused with an
+     * answer; the server drops the connection. Before v0.3.0 this said 64 MiB,
+     * which let a request the server would never read leave this client.
+     */
+    public const MAX_FRAME = 16 * 1024 * 1024;
 
     public const PROTOCOL_V2 = 0x02;
 
@@ -94,8 +100,11 @@ final class Wire
     public const OP_PUT_BATCH = 'put_batch';
 
     /**
-     * The server's own per-batch cap, `wire.MaxPutBatchSize`: it bounds how long
-     * one batch holds the shard write lock.
+     * `wire.MaxPutBatchSize`. The server does not refuse a larger batch - its
+     * decoder never checks, and a 4097-entry batch applied in full on
+     * v0.7.0-beta6 - but its own clients split at this size, because it bounds
+     * how long one batch holds the shard write lock. This client splits at it
+     * for the same reason.
      */
     public const MAX_PUT_BATCH_ENTRIES = 4096;
 
@@ -130,9 +139,12 @@ final class Wire
             $body = chr(self::PROTOCOL_V2).chr(strlen($token)).$token.$body;
         }
 
-        if (4 + strlen($body) > self::MAX_FRAME) {
+        // The same bound the server reads with: the length prefix, which is the
+        // body alone. Refused here, the caller gets a reason; sent, the server
+        // would close the socket and the caller would get a dropped connection.
+        if (strlen($body) > self::MAX_FRAME) {
             throw new ProtocolException(
-                'request frame of '.(4 + strlen($body)).' bytes exceeds the server limit of '.self::MAX_FRAME
+                'request body of '.strlen($body).' bytes exceeds the server limit of '.self::MAX_FRAME
             );
         }
 
@@ -225,9 +237,6 @@ final class Wire
     }
 
     /**
-     * Read the i64 that incr_ex and ttl answer with.
-     */
-    /**
      * `{count u32}` followed by each entry in the exact single-put layout.
      *
      * @param  list<array{0: string, 1: string, 2: int}>  $entries  key, value, TTL in milliseconds
@@ -236,7 +245,7 @@ final class Wire
     {
         if (count($entries) > self::MAX_PUT_BATCH_ENTRIES) {
             throw new ProtocolException(sprintf(
-                'a put_batch carries at most %d entries, got %d - split it first',
+                'a put_batch is split at %d entries here, got %d - split it first',
                 self::MAX_PUT_BATCH_ENTRIES,
                 count($entries)
             ));
@@ -266,6 +275,9 @@ final class Wire
         return $unpacked[1];
     }
 
+    /**
+     * Read the i64 that incr_ex and ttl answer with.
+     */
     public static function decodeCounter(string $payload): int
     {
         if (strlen($payload) !== 8) {

@@ -143,7 +143,7 @@ class PutManyTopologyTest extends TestCase
         );
     }
 
-    public function test_past_the_servers_cap_it_sends_more_than_one_batch_in_one_round_trip(): void
+    public function test_past_the_entry_split_it_sends_more_than_one_batch_in_one_round_trip(): void
     {
         $client = $this->client(['topology' => 'single-node']);
         $entries = $this->entries(Wire::MAX_PUT_BATCH_ENTRIES + 1);
@@ -151,7 +151,67 @@ class PutManyTopologyTest extends TestCase
         $client->putMany($entries);
 
         $this->assertSame([Wire::OP_REPL_METRICS, Wire::OP_PUT_BATCH, Wire::OP_PUT_BATCH], $client->ops);
+
+        // One exchange for the topology check, one for both batches together.
+        // Counting commands alone would not tell that from a call per batch.
+        $this->assertSame(2, $client->roundTrips);
         $this->assertAllReadable($entries);
+    }
+
+    /**
+     * The server drops the connection on a body over 16 MiB, and 1100 entries
+     * of 16 KiB are already that. A split at a 64 MiB budget - which this
+     * client used to assume - sent one such body and wrote nothing at all.
+     * Run in both modes: the fake now closes the connection exactly as the
+     * server does, so it cannot pass what the server would refuse.
+     *
+     * Many small values rather than a few large ones, deliberately. A value
+     * must also fit one cache page, and on a default single-node server that
+     * is far below the frame limit - about 1 MiB, measured on v0.6.0 and
+     * v0.7.0-beta6 - so large values would test the page, not the frame.
+     */
+    public function test_a_call_larger_than_one_frame_is_split_and_written_in_full(): void
+    {
+        $client = $this->client(['topology' => 'single-node']);
+
+        $entries = $this->entries(1100);
+        foreach ($entries as $index => $entry) {
+            $entries[$index][1] = str_pad((string) $index, 16 * 1024, '.');
+        }
+
+        $client->putMany($entries);
+
+        $this->assertGreaterThanOrEqual(2, count(array_keys($client->ops, Wire::OP_PUT_BATCH, true)));
+        $this->assertAllReadable($entries);
+    }
+
+    /**
+     * `__repl_metrics__` exists in every release this client supports, so an
+     * error from it is never "this server cannot say". It is thrown - nothing
+     * is written on the strength of an unanswered question - and it is not
+     * remembered, so the next call asks again.
+     */
+    public function test_a_topology_check_that_fails_is_thrown_and_asked_again(): void
+    {
+        $this->client();
+        $client = new FailsTheFirstTopologyCheck(ConnectionConfig::fromArray(
+            $this->server->connectionConfig(['topology' => 'single-node'])
+        ));
+        [$first, $second] = $this->entries(2);
+
+        try {
+            $client->putMany([$first]);
+            $this->fail('a batch was written although the topology check failed');
+        } catch (ServerException $exception) {
+            $this->assertSame(Status::ERROR, $exception->status);
+        }
+
+        $this->assertNull($this->plainClient()->get($first[0]));
+
+        $client->putMany([$second]);
+
+        $this->assertSame([Wire::OP_REPL_METRICS, Wire::OP_REPL_METRICS, Wire::OP_PUT_BATCH], $client->ops);
+        $this->assertSame($second[1], $this->plainClient()->get($second[0]));
     }
 
     /**
@@ -227,10 +287,13 @@ class PutManyTopologyTest extends TestCase
     }
 
     /**
-     * The server answers how many entries it applied. Fewer than were sent is a
-     * write that did not fully happen, and it surfaces rather than returning as
-     * though every key landed. No real server can be made to shortchange a
-     * batch on request, so the answer is altered on its way back.
+     * A check on the answer, not on a behaviour the server is known to have.
+     *
+     * On success rostam always reports every entry applied - v0.7.0-beta6
+     * skips an entry it cannot store and answers an error instead - so no real
+     * server produces this. A count that does not add up is still not an answer
+     * to return past as though it did, and since no server can be made to send
+     * one, it is altered on its way back.
      */
     public function test_a_batch_applied_short_of_what_was_sent_is_reported(): void
     {
@@ -293,19 +356,46 @@ final class ShortchangedClient extends TcpClient
 }
 
 /**
- * A TcpClient that remembers every op it put on the wire, in order.
+ * A TcpClient that remembers every op it put on the wire, in order, and how
+ * many exchanges carried them.
  */
-final class RecordingClient extends TcpClient
+class RecordingClient extends TcpClient
 {
     /** @var list<string> */
     public array $ops = [];
 
+    public int $roundTrips = 0;
+
     protected function dispatch(array $commands): array
     {
+        $this->roundTrips++;
+
         foreach ($commands as $command) {
             $this->ops[] = $command->op;
         }
 
         return parent::dispatch($commands);
+    }
+}
+
+/**
+ * A TcpClient whose first topology check comes back as the generic error.
+ */
+final class FailsTheFirstTopologyCheck extends RecordingClient
+{
+    private bool $failed = false;
+
+    protected function dispatch(array $commands): array
+    {
+        $responses = parent::dispatch($commands);
+
+        foreach ($commands as $index => $command) {
+            if ($command->op === Wire::OP_REPL_METRICS && ! $this->failed) {
+                $this->failed = true;
+                $responses[$index] = new Response(Status::ERROR, 'internal error');
+            }
+        }
+
+        return $responses;
     }
 }

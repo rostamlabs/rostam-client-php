@@ -30,7 +30,11 @@ final class KvMetrics
     /** Keys currently held in the index. */
     public const ENTRIES = 'rostam_kv_entries';
 
-    private const SAMPLE = '/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^}]*\})?[ \t]+(\S+)(?:[ \t]+-?\d+)?$/';
+    private const NAME = '/\G[a-zA-Z_:][a-zA-Z0-9_:]*/';
+
+    private const LABEL_NAME = '/\G[a-zA-Z_][a-zA-Z0-9_]*/';
+
+    private const VALUE_AND_TIMESTAMP = '/\G[ \t]+(\S+)(?:[ \t]+-?\d+)?$/';
 
     /**
      * @param  array<string, array<string, int|float>>  $series  name => (label set => value); '' is the unlabelled sample
@@ -51,11 +55,7 @@ final class KvMetrics
                 continue;
             }
 
-            if (preg_match(self::SAMPLE, $line, $match) !== 1) {
-                throw new ProtocolException(sprintf('kv metrics line %d is not a Prometheus sample: %s', $number + 1, $line));
-            }
-
-            [, $name, $labels, $value] = $match;
+            [$name, $labels, $value] = self::sample($line, $number + 1);
 
             if (isset($series[$name][$labels])) {
                 throw new ProtocolException(sprintf('kv metrics line %d repeats the series %s%s', $number + 1, $name, $labels));
@@ -65,6 +65,128 @@ final class KvMetrics
         }
 
         return new self($series);
+    }
+
+    /**
+     * One sample line: a name, an optional label set, a value, an optional timestamp.
+     *
+     * The label set is scanned, not matched with a pattern, because a label
+     * value is a quoted string and may hold any of `}`, `,` and an escaped
+     * quote. It comes back in a canonical form - labels sorted by name - so
+     * the same series written in another order is still caught as a repeat,
+     * and an empty `{}` is the unlabelled sample it means rather than a
+     * separate series nobody would look up.
+     *
+     * @return array{0: string, 1: string, 2: string} name, canonical label set, raw value
+     */
+    private static function sample(string $line, int $number): array
+    {
+        $malformed = static fn (string $why) => new ProtocolException(
+            sprintf('kv metrics line %d is not a Prometheus sample (%s): %s', $number, $why, $line)
+        );
+
+        if (preg_match(self::NAME, $line, $match) !== 1) {
+            throw $malformed('no metric name');
+        }
+
+        $name = $match[0];
+        $at = strlen($name);
+        $labels = [];
+
+        if (($line[$at] ?? '') === '{') {
+            $at++;
+
+            while (true) {
+                $at += strspn($line, " \t", $at);
+
+                if (($line[$at] ?? '') === '}') {
+                    $at++;
+
+                    break;
+                }
+
+                if (preg_match(self::LABEL_NAME, $line, $match, 0, $at) !== 1) {
+                    throw $malformed('a label without a name');
+                }
+
+                $label = $match[0];
+                $at += strlen($label);
+
+                if (($line[$at] ?? '') !== '=' || ($line[$at + 1] ?? '') !== '"') {
+                    throw $malformed("label {$label} is not name=\"value\"");
+                }
+
+                $at += 2;
+                $value = '';
+
+                while (true) {
+                    $char = $line[$at] ?? null;
+
+                    if ($char === null) {
+                        throw $malformed("label {$label} is never closed");
+                    }
+
+                    $at++;
+
+                    if ($char === '"') {
+                        break;
+                    }
+
+                    if ($char === '\\') {
+                        $escaped = $line[$at] ?? null;
+                        $at++;
+                        $value .= match ($escaped) {
+                            'n' => "\n",
+                            '\\', '"' => $escaped,
+                            default => throw $malformed("label {$label} has an unknown escape"),
+                        };
+
+                        continue;
+                    }
+
+                    $value .= $char;
+                }
+
+                if (array_key_exists($label, $labels)) {
+                    throw $malformed("label {$label} appears twice");
+                }
+
+                $labels[$label] = $value;
+                $at += strspn($line, " \t", $at);
+
+                if (($line[$at] ?? '') === ',') {
+                    $at++;
+                } elseif (($line[$at] ?? '') !== '}') {
+                    throw $malformed('labels are not separated by commas');
+                }
+            }
+        }
+
+        if (preg_match(self::VALUE_AND_TIMESTAMP, $line, $match, 0, $at) !== 1) {
+            throw $malformed('no value');
+        }
+
+        return [$name, self::canonical($labels), $match[1]];
+    }
+
+    /**
+     * @param  array<string, string>  $labels
+     */
+    private static function canonical(array $labels): string
+    {
+        if ($labels === []) {
+            return '';
+        }
+
+        ksort($labels, SORT_STRING);
+
+        $pairs = [];
+
+        foreach ($labels as $label => $value) {
+            $pairs[] = $label.'="'.addcslashes($value, "\\\"\n").'"';
+        }
+
+        return '{'.implode(',', $pairs).'}';
     }
 
     public function has(string $name): bool
