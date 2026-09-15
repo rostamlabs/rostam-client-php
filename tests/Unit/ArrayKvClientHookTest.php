@@ -63,6 +63,30 @@ class ArrayKvClientHookTest extends TestCase
         ], $seen);
     }
 
+    /**
+     * A hook that writes the same key without clearing itself used to call
+     * itself back until the stack ran out. Its own writes are not announced.
+     */
+    public function test_writes_made_by_the_hook_do_not_call_it_again(): void
+    {
+        $client = new ArrayKvClient;
+        $calls = 0;
+
+        $client->beforeWrite = function (string $key, ArrayKvClient $self) use (&$calls): void {
+            $calls++;
+            $self->del($key);
+            $self->increment('rival');
+        };
+
+        $client->put('k', 'v1');
+        $this->assertSame(1, $calls);
+        $this->assertSame('v1', $client->get('k'));
+
+        // ...and the next write outside it is announced as usual.
+        $client->put('k', 'v2');
+        $this->assertSame(2, $calls);
+    }
+
     /** Called before the write, so what the hook does is what the op then meets. */
     public function test_a_rival_write_in_the_hook_is_what_the_op_then_sees(): void
     {

@@ -39,10 +39,15 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
      * flush names no key and does not call it. Lets a test wedge a rival op
      * into the window just before a write.
      *
+     * Writes the hook makes itself do not call it again, so a rival that
+     * deletes or bumps the very key does not recurse without end.
+     *
      * Before v0.3.0 only put and setNx called it, so a test that hooked a
      * compare-and-swap never ran its rival and passed without proving anything.
      */
     public ?Closure $beforeWrite = null;
+
+    private bool $announcing = false;
 
     public function get(string $key): ?string
     {
@@ -361,8 +366,16 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
 
     private function announce(string $key): void
     {
-        if ($this->beforeWrite !== null) {
+        if ($this->beforeWrite === null || $this->announcing) {
+            return;
+        }
+
+        $this->announcing = true;
+
+        try {
             ($this->beforeWrite)($key, $this);
+        } finally {
+            $this->announcing = false;
         }
     }
 
