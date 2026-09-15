@@ -18,7 +18,8 @@ use Rostam\Exceptions\ProtocolException;
  *     response  [bodyLen u32][status u8][payloadLen u32][payload]
  *
  * v2 is used when an auth token is configured, v1 otherwise - mirroring the Go
- * and Python clients. The key-value ops this package speaks (Rostam v0.5.0):
+ * and Python clients. The key-value ops this package speaks, with the release
+ * each first appears in (v0.5.0 unless noted):
  *
  *     get      [keyLen u16][key]                                      -> value (or NOT_FOUND)
  *     put      [keyLen u16][key][valLen u32][val][ttlMs u64]
@@ -34,6 +35,10 @@ use Rostam\Exceptions\ProtocolException;
  *     cas      [keyLen u16][key][valLen u32][val][has u8][expLen u32][expected][ttlMs u64] -> one byte
  *     cad      [keyLen u16][key][expLen u32][expected]                -> one byte
  *     caex     [keyLen u16][key][expLen u32][expected][ttlMs u64]     -> one byte
+ *     put_batch [count u32]{[keyLen u16][key][valLen u32][val][ttlMs u64]}* -> applied u32
+ *     flush    (no args)                                              -> empty   (v0.6.0)
+ *     __repl_metrics__ (no args)                                      -> JSON
+ *     __kv_metrics__   (no args)                                      -> Prometheus text (v0.7.0-beta3)
  */
 final class Wire
 {
@@ -79,6 +84,30 @@ final class Wire
      * `flush` carrying the key `app:` still removed `session:b`.
      */
     public const OP_FLUSH = 'flush';
+
+    /**
+     * Many puts as one op: `{count u32}` then that many single-put layouts.
+     * Present since at least v0.5.0. The whole batch is ROUTED BY ITS FIRST KEY,
+     * which is harmless on a single node and loses keys on a cluster - see
+     * {@see Topology}.
+     */
+    public const OP_PUT_BATCH = 'put_batch';
+
+    /**
+     * The server's own per-batch cap, `wire.MaxPutBatchSize`: it bounds how long
+     * one batch holds the shard write lock.
+     */
+    public const MAX_PUT_BATCH_ENTRIES = 4096;
+
+    /** This node's key-value counters as Prometheus text. v0.7.0-beta3 and newer. */
+    public const OP_KV_METRICS = '__kv_metrics__';
+
+    /**
+     * Per hosted shard replication state, as JSON. An empty shard list on a single
+     * node - and on a cluster member that hosts no shards, which is why it can
+     * prove replication but never its absence. Present since at least v0.5.0.
+     */
+    public const OP_REPL_METRICS = '__repl_metrics__';
 
     private const MAX_KEY_LENGTH = 0xFFFF;
 
@@ -198,6 +227,45 @@ final class Wire
     /**
      * Read the i64 that incr_ex and ttl answer with.
      */
+    /**
+     * `{count u32}` followed by each entry in the exact single-put layout.
+     *
+     * @param  list<array{0: string, 1: string, 2: int}>  $entries  key, value, TTL in milliseconds
+     */
+    public static function putBatchArgs(array $entries): string
+    {
+        if (count($entries) > self::MAX_PUT_BATCH_ENTRIES) {
+            throw new ProtocolException(sprintf(
+                'a put_batch carries at most %d entries, got %d - split it first',
+                self::MAX_PUT_BATCH_ENTRIES,
+                count($entries)
+            ));
+        }
+
+        $args = pack('N', count($entries));
+
+        foreach ($entries as [$key, $value, $ttlMilliseconds]) {
+            $args .= self::putArgs($key, $value, $ttlMilliseconds);
+        }
+
+        return $args;
+    }
+
+    /**
+     * The applied-entry count a put_batch answers with.
+     */
+    public static function decodePutBatchResult(string $payload): int
+    {
+        if (strlen($payload) !== 4) {
+            throw new ProtocolException('expected a 4-byte put_batch count, got '.strlen($payload).' bytes');
+        }
+
+        /** @var array{1: int} $unpacked */
+        $unpacked = unpack('N', $payload);
+
+        return $unpacked[1];
+    }
+
     public static function decodeCounter(string $payload): int
     {
         if (strlen($payload) !== 8) {

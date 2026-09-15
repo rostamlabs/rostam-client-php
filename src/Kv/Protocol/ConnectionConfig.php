@@ -5,6 +5,8 @@ declare(strict_types=1);
 
 namespace Rostam\Kv\Protocol;
 
+use InvalidArgumentException;
+
 /**
  * Everything needed to open a socket to a Rostam server's -tcp listener.
  */
@@ -24,15 +26,35 @@ final class ConnectionConfig
         public readonly array $sslOptions = [],
         public readonly int $poolSize = 4,
         public readonly bool $retryOnStaleConnection = true,
+        public readonly Topology $topology = Topology::Unknown,
     ) {}
 
     /**
      * @param  array<string, mixed>  $config
+     *
+     * @throws InvalidArgumentException on a `topology` that is not one of the declared values
      */
     public static function fromArray(array $config): self
     {
         $tls = $config['tls'] ?? false;
         $tls = is_array($tls) ? $tls : ['enabled' => (bool) $tls];
+
+        $declared = $config['topology'] ?? Topology::Unknown;
+
+        // Refused rather than defaulted. An unrecognised value would fall back to
+        // the safe, slower path without a word, and whoever wrote `single_node`
+        // meaning the fast one would never find out why it is not taken. The
+        // enum itself is accepted too: casting it to a string is an Error.
+        $topology = match (true) {
+            $declared instanceof Topology => $declared,
+            is_string($declared) && Topology::tryFrom($declared) !== null => Topology::from($declared),
+            default => throw new InvalidArgumentException(sprintf(
+                "unknown topology [%s]: expected '%s' (the default, safe on any server) or '%s'",
+                is_scalar($declared) ? (string) $declared : get_debug_type($declared),
+                Topology::Unknown->value,
+                Topology::SingleNode->value,
+            )),
+        };
 
         return new self(
             host: (string) ($config['host'] ?? '127.0.0.1'),
@@ -45,6 +67,7 @@ final class ConnectionConfig
             sslOptions: self::sslOptionsFrom($tls),
             poolSize: max(1, (int) ($config['pool_size'] ?? 4)),
             retryOnStaleConnection: (bool) ($config['retry_on_stale_connection'] ?? true),
+            topology: $topology,
         );
     }
 

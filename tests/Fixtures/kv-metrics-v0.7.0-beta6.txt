@@ -1,0 +1,99 @@
+# HELP rostam_kv_gets_total KV reads served
+# TYPE rostam_kv_gets_total counter
+rostam_kv_gets_total 400
+# HELP rostam_kv_hits_total KV reads that found a live entry
+# TYPE rostam_kv_hits_total counter
+rostam_kv_hits_total 235
+# HELP rostam_kv_misses_total KV reads that found nothing
+# TYPE rostam_kv_misses_total counter
+rostam_kv_misses_total 165
+# HELP rostam_kv_puts_total KV write ATTEMPTS - incremented before a capacity rejection can return ErrFull, so it includes writes that failed
+# TYPE rostam_kv_puts_total counter
+rostam_kv_puts_total 400
+# HELP rostam_kv_dels_total KV deletes applied
+# TYPE rostam_kv_dels_total counter
+rostam_kv_dels_total 0
+# HELP rostam_kv_expirations_total entries retired because their TTL elapsed
+# TYPE rostam_kv_expirations_total counter
+rostam_kv_expirations_total 0
+# HELP rostam_kv_evictions_total entries displaced by ringbuf eviction, live or already superseded
+# TYPE rostam_kv_evictions_total counter
+rostam_kv_evictions_total 165
+# HELP rostam_kv_evictions_live_total entries displaced by ringbuf eviction that were still the live record for their key - lost to capacity, not TTL
+# TYPE rostam_kv_evictions_live_total counter
+rostam_kv_evictions_live_total 165
+# HELP rostam_kv_eviction_relocations_total live records copied forward by relocating eviction instead of being dropped with the dead versions sharing their page - the saves that did NOT become evictions_live
+# TYPE rostam_kv_eviction_relocations_total counter
+rostam_kv_eviction_relocations_total 0
+# HELP rostam_kv_eviction_bytes_relocated_total bytes copied by those relocations - the write-path cost of the saves
+# TYPE rostam_kv_eviction_bytes_relocated_total counter
+rostam_kv_eviction_bytes_relocated_total 0
+# HELP rostam_kv_reserve_relocations_total live records copied forward by the background free-page reserve instead of by a write - read against eviction_relocations to see how much of the copying the write path is still paying for
+# TYPE rostam_kv_reserve_relocations_total counter
+rostam_kv_reserve_relocations_total 0
+# HELP rostam_kv_reserve_bytes_relocated_total bytes copied by the background reserve - background work, not write-path cost
+# TYPE rostam_kv_reserve_bytes_relocated_total counter
+rostam_kv_reserve_bytes_relocated_total 0
+# HELP rostam_kv_reserve_pages_freed_total pages the background reserve fully evacuated and retired - the free pages it produced for the write path
+# TYPE rostam_kv_reserve_pages_freed_total counter
+rostam_kv_reserve_pages_freed_total 0
+# HELP rostam_kv_rejects_total writes refused under PolicyRejectWrites
+# TYPE rostam_kv_rejects_total counter
+rostam_kv_rejects_total 0
+# HELP rostam_kv_seqlock_retries_total lock-free read attempts discarded because a same-size update moved the bytes mid-read
+# TYPE rostam_kv_seqlock_retries_total counter
+rostam_kv_seqlock_retries_total 0
+# HELP rostam_kv_seqlock_fallbacks_total reads that spent their retry budget and took the shard read lock instead - should be near zero
+# TYPE rostam_kv_seqlock_fallbacks_total counter
+rostam_kv_seqlock_fallbacks_total 0
+# HELP rostam_kv_inplace_updates_total writes that overwrote the stored copy of their key where it lay, instead of appending a new copy and leaving the old one framed and dead - the writes that created no garbage; requires a heap ringbuf shard with in-place same-size updates enabled
+# TYPE rostam_kv_inplace_updates_total counter
+rostam_kv_inplace_updates_total 0
+# HELP rostam_kv_corruption_errors_total unreadable page bytes met - once per read that hits a damaged entry, plus once per region the warm restart or the eviction drain gives up on
+# TYPE rostam_kv_corruption_errors_total counter
+rostam_kv_corruption_errors_total 0
+# HELP rostam_kv_corruption_bytes_discarded_total page bytes the warm restart or the eviction drain discarded unread - not incremented by reads, so not a per-incident size for corruption_errors
+# TYPE rostam_kv_corruption_bytes_discarded_total counter
+rostam_kv_corruption_bytes_discarded_total 0
+# HELP rostam_kv_compactions_total page files rewritten live-only at shard open (mmap)
+# TYPE rostam_kv_compactions_total counter
+rostam_kv_compactions_total 0
+# HELP rostam_kv_compactions_aborted_total compactions decided against or abandoned; the original file was kept
+# TYPE rostam_kv_compactions_aborted_total counter
+rostam_kv_compactions_aborted_total 0
+# HELP rostam_kv_compaction_bytes_reclaimed_total page bytes dropped by those rewrites
+# TYPE rostam_kv_compaction_bytes_reclaimed_total counter
+rostam_kv_compaction_bytes_reclaimed_total 0
+# HELP rostam_kv_compaction_duration_ms_total milliseconds spent compacting at open - this is startup latency
+# TYPE rostam_kv_compaction_duration_ms_total counter
+rostam_kv_compaction_duration_ms_total 0
+# HELP rostam_kv_online_relocations_total live entries relocated by online compaction
+# TYPE rostam_kv_online_relocations_total counter
+rostam_kv_online_relocations_total 0
+# HELP rostam_kv_online_bytes_relocated_total bytes moved by those relocations
+# TYPE rostam_kv_online_bytes_relocated_total counter
+rostam_kv_online_bytes_relocated_total 0
+# HELP rostam_kv_online_pages_retired_total source pages fully evacuated and marked retired
+# TYPE rostam_kv_online_pages_retired_total counter
+rostam_kv_online_pages_retired_total 0
+# HELP rostam_kv_online_pages_recycled_total retired pages whose quarantine elapsed and were reset into writable space
+# TYPE rostam_kv_online_pages_recycled_total counter
+rostam_kv_online_pages_recycled_total 0
+# HELP rostam_kv_pages_allocated cache pages currently allocated
+# TYPE rostam_kv_pages_allocated gauge
+rostam_kv_pages_allocated 16
+# HELP rostam_kv_bytes_allocated bytes backing those pages
+# TYPE rostam_kv_bytes_allocated gauge
+rostam_kv_bytes_allocated 268435456
+# HELP rostam_kv_bytes_used bytes occupied by entries in resident pages, INCLUDING superseded and expired entries not yet reclaimed - occupancy, not live data
+# TYPE rostam_kv_bytes_used gauge
+rostam_kv_bytes_used 246424055
+# HELP rostam_kv_entries keys currently held in the index - the denominator the eviction counters lack, and what to divide a memory budget by; bytes_used/entries is occupancy per key INCLUDING superseded, expired and deleted-but-unreclaimed bytes, not the size of one record
+# TYPE rostam_kv_entries gauge
+rostam_kv_entries 235
+# HELP rostam_kv_tombstones index slots holding a deleted key that has not been reclaimed; a large share of entries means the index wants compacting
+# TYPE rostam_kv_tombstones gauge
+rostam_kv_tombstones 123
+# HELP rostam_kv_reclaimable_bytes page bytes held by entries no longer reachable
+# TYPE rostam_kv_reclaimable_bytes gauge
+rostam_kv_reclaimable_bytes 0

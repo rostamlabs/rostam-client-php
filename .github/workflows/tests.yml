@@ -66,7 +66,7 @@ jobs:
         run: vendor/bin/phpunit
 
   conformance:
-    name: conformance against a real rostam-server
+    name: conformance against rostam-server (${{ matrix.channel }})
     runs-on: ubuntu-latest
 
     # The suite's default target is a fake server written in PHP - fast, and able
@@ -74,6 +74,17 @@ jobs:
     # the same hand that wrote the client, so a shared misreading of the wire
     # would pass every test here and still fail in production. This lane rules
     # that class out by talking to the real binary.
+    #
+    # Twice. GitHub's releases/latest skips pre-releases, so it answers the stable
+    # server people run today - and a lane that only ever saw that one would
+    # never meet an op that arrived in a beta. The pre-release lane takes the
+    # newest release of any kind. Tests for an op newer than the server they
+    # meet skip, by the version this job reads from the binary itself.
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, prerelease]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -85,15 +96,25 @@ jobs:
       - name: Install dependencies
         uses: ramsey/composer-install@v3
 
-      - name: Fetch the latest rostam-server
+      - name: Fetch rostam-server (${{ matrix.channel }})
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          url=$(curl -fsSL https://api.github.com/repos/rostamlabs/rostam/releases/latest \
+          if [ "${{ matrix.channel }}" = "stable" ]; then
+            api="https://api.github.com/repos/rostamlabs/rostam/releases/latest"
+          else
+            api="https://api.github.com/repos/rostamlabs/rostam/releases?per_page=1"
+          fi
+          url=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
             | grep -o 'https://[^"]*linux_amd64\.tar\.gz' | head -n1)
           echo "downloading $url"
           curl -fsSL "$url" -o rostam.tar.gz
           tar xzf rostam.tar.gz
-          ./rostam-server --version
+          # "rostam-server 0.7.0-beta6 (go1.26.5 linux/amd64)" -> 0.7.0-beta6
+          version=$(./rostam-server --version | awk '{print $2}')
+          echo "rostam-server $version"
+          echo "ROSTAM_TEST_SERVER_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Start it on the binary TCP listener
         run: |
