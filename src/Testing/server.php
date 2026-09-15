@@ -16,10 +16,11 @@ declare(strict_types=1);
  *   - anything it cannot carry out - an unknown op, args it could not
  *     decode, incr_ex on a non-counter key - comes back as the same bare
  *     "internal error", because that is all rostam distinguishes;
- *   - with one exception, a layer lower: a frame whose header points past the
- *     end of what arrived is named, `server: frame truncated`. Both were
- *     measured against a real v0.6.0 and again on v0.7.0-beta6, and neither
- *     closes the connection;
+ *   - with two exceptions, a layer lower, where the body itself is decoded: a
+ *     header pointing past the end of what arrived is `server: frame
+ *     truncated`, and an args length that would take the request over 16 MiB
+ *     is `server: frame too large`. Measured against v0.6.0, v0.7.0-beta6 and
+ *     v0.7.0-beta7; none of them closes the connection;
  *   - a length prefix of zero or over 16 MiB (`server.MaxFrameSize`) is not
  *     answered at all: the connection is closed, as the server closes it;
  *   - answers are buffered and written as the socket accepts them, so a large
@@ -60,13 +61,20 @@ const MODERN_OPS = ['set_nx', 'cas', 'cad', 'caex', 'exists', 'getdel', 'getset'
 // lets a test pass on a distinction the real server never makes.
 const GENERIC_ERROR = 'internal error';
 
-// The one exception, and it lives a layer lower: a frame whose own header
-// points past the end of what arrived is named. Measured on v0.6.0 -
-// a body of op-length 3, "put", and a single byte where the four-byte
+// The two exceptions, and they live a layer lower, in decoding the body
+// itself. A frame whose own header points past the end of what arrived is
+// named: a body of op-length 3, "put", and a single byte where the four-byte
 // args length belongs answers `server: frame truncated`, not `internal error`.
 const TRUNCATED_FRAME = 'server: frame truncated';
 
-// server.MaxFrameSize: v0.5.0 through v0.7.0-beta6.
+// And an args length that would make the request larger than the frame limit,
+// checked before truncation. Since v0.7.0-beta6 at the latest the bound is on
+// the op header plus the args (`server.DecodeRequest`); v0.6.0 compared the
+// args length alone, so the two differ only within an op header's width of
+// 16 MiB. This follows the newer rule.
+const FRAME_TOO_LARGE = 'server: frame too large';
+
+// server.MaxFrameSize: v0.5.0 through v0.7.0-beta7.
 const MAX_FRAME_BODY = 16 * 1024 * 1024;
 
 $server = stream_socket_server('tcp://127.0.0.1:0', $errorNumber, $errorMessage);
@@ -229,6 +237,8 @@ function respond(string $body, string $token, bool $legacy, array &$store): stri
     // thing the real server never does.
     try {
         [$op, $args, $sent] = decodeBody($body);
+    } catch (OverflowException) {
+        return errorFrame(FRAME_TOO_LARGE);
     } catch (Throwable) {
         return errorFrame(TRUNCATED_FRAME);
     }
@@ -573,6 +583,12 @@ function decodeBody(string $body): array
     $opLength = ord(take($body, $offset, 1));
     $op = take($body, $offset + 1, $opLength);
     [$argsLength, $argsOffset] = takeNumber($body, $offset + 1 + $opLength, 'N', 4);
+
+    // Before truncation, as the server orders them. The header counted is the
+    // v1 body's own - the token prefix of a v2 frame is not part of it.
+    if (1 + $opLength + 4 + $argsLength > MAX_FRAME_BODY) {
+        throw new OverflowException(FRAME_TOO_LARGE);
+    }
 
     return [$op, take($body, $argsOffset, $argsLength), $sentToken];
 }

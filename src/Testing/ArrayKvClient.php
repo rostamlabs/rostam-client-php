@@ -32,7 +32,16 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
     /** @var list<string> */
     public array $ops = [];
 
-    /** Fires just before a write lands - lets a test wedge a rival op into a window. */
+    /**
+     * Called with ($key, $this) before every op that may change a key, whether
+     * or not it then does: put, setNx, cas, cad, caex, getdel, getset, del,
+     * increment, expire and persist, and putMany and delMany once per key.
+     * flush names no key and does not call it. Lets a test wedge a rival op
+     * into the window just before a write.
+     *
+     * Before v0.3.0 only put and setNx called it, so a test that hooked a
+     * compare-and-swap never ran its rival and passed without proving anything.
+     */
     public ?Closure $beforeWrite = null;
 
     public function get(string $key): ?string
@@ -68,6 +77,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
         $this->ops[] = 'putMany';
 
         foreach ($entries as [$key, $value, $ttl]) {
+            $this->announce($key);
             $this->write($key, $value, $unit->toMilliseconds($ttl));
         }
     }
@@ -89,6 +99,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
     public function cas(string $key, string $value, ?string $expected, int $ttl = 0, TimeUnit $unit = TimeUnit::Seconds): bool
     {
         $this->ops[] = 'cas';
+        $this->announce($key);
 
         $entry = $this->live($key);
 
@@ -108,6 +119,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
     public function cad(string $key, string $expected): bool
     {
         $this->ops[] = 'cad';
+        $this->announce($key);
 
         $entry = $this->live($key);
 
@@ -123,6 +135,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
     public function caex(string $key, string $expected, int $ttl, TimeUnit $unit = TimeUnit::Seconds): bool
     {
         $this->ops[] = 'caex';
+        $this->announce($key);
 
         $entry = $this->live($key);
 
@@ -138,6 +151,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
     public function getdel(string $key): ?string
     {
         $this->ops[] = 'getdel';
+        $this->announce($key);
 
         $entry = $this->live($key);
         unset($this->store[$key]);
@@ -148,6 +162,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
     public function getset(string $key, string $value, int $ttl = 0, TimeUnit $unit = TimeUnit::Seconds): ?string
     {
         $this->ops[] = 'getset';
+        $this->announce($key);
 
         $previous = $this->live($key);
         $this->write($key, $value, $unit->toMilliseconds($ttl));
@@ -165,6 +180,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
     public function del(string $key): bool
     {
         $this->ops[] = 'del';
+        $this->announce($key);
 
         $existed = $this->live($key) !== null;
         unset($this->store[$key]);
@@ -179,6 +195,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
         $existed = [];
 
         foreach ($keys as $key) {
+            $this->announce($key);
             $existed[$key] = $this->live($key) !== null;
             unset($this->store[$key]);
         }
@@ -189,6 +206,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
     public function increment(string $key, int $delta = 1, int $ttl = 0, TimeUnit $unit = TimeUnit::Seconds): int
     {
         $this->ops[] = 'increment';
+        $this->announce($key);
 
         $entry = $this->live($key);
 
@@ -215,6 +233,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
     public function expire(string $key, int $ttl, TimeUnit $unit = TimeUnit::Seconds): bool
     {
         $this->ops[] = 'expire';
+        $this->announce($key);
 
         if ($this->live($key) === null) {
             return false;
@@ -228,6 +247,7 @@ final class ArrayKvClient implements KvClient, ReportsKvMetrics
     public function persist(string $key): bool
     {
         $this->ops[] = 'persist';
+        $this->announce($key);
 
         $entry = $this->live($key);
 

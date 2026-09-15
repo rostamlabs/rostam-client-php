@@ -440,6 +440,51 @@ class TcpClientTest extends TestCase
     }
 
     /**
+     * The other name rostam gives a malformed body: args declared larger than
+     * any frame could carry. Checked before truncation, so a four-gigabyte
+     * claim on a tiny body is "too large", not "truncated" - byte for byte the
+     * same on v0.6.0, v0.7.0-beta6 and v0.7.0-beta7.
+     */
+    public function test_args_declared_past_the_frame_limit_are_named_too_large(): void
+    {
+        $client = $this->client();
+
+        $body = chr(3).'get'.pack('N', 0xFFFFFFFF).'ab';
+        $response = $this->sendRaw(pack('N', strlen($body)).$body);
+
+        $this->assertSame(Status::ERROR, $response->status);
+        $this->assertSame(pack('n', 23).'server: frame too large', $response->payload);
+
+        $this->assertTrue($client->ping());
+    }
+
+    /**
+     * Where the bound sits: on the op header and the args together. Args of
+     * exactly 16 MiB fit the old rule (the args alone) and not the new one, so
+     * this runs only where the new one was measured.
+     */
+    public function test_the_frame_limit_counts_the_op_header_with_the_args(): void
+    {
+        if (! FakeServer::supports('0.7.0-beta6')) {
+            $this->markTestSkipped('v0.6.0 compared the args length alone');
+        }
+
+        $client = $this->client();
+
+        $body = chr(3).'get'.pack('N', 16 * 1024 * 1024).'ab';
+        $response = $this->sendRaw(pack('N', strlen($body)).$body);
+
+        $this->assertSame(pack('n', 23).'server: frame too large', $response->payload);
+
+        $body = chr(3).'get'.pack('N', 16 * 1024 * 1024 - 8).'ab';
+        $response = $this->sendRaw(pack('N', strlen($body)).$body);
+
+        $this->assertSame(pack('n', 23).'server: frame truncated', $response->payload);
+
+        $this->assertTrue($client->ping());
+    }
+
+    /**
      * A body over `server.MaxFrameSize` is not answered at all: the server
      * closes the connection on reading the length prefix. Asserted in both
      * modes, which is what keeps the fake from reading a size the server would
