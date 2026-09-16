@@ -195,7 +195,9 @@ Two limits, and the second is usually the one you meet.
   | 128 MiB / 1 | 8 MiB | 8,388,578 |
 
   So the limit is the same at every key length — a 60-byte key leaves 60 bytes less
-  for the value — and about 30 bytes under the page. Most deployments sit on the
+  for the value — and sits 30 bytes under the page on an in-memory shard, 46 under
+  it on a persistent one (`-data`, which is what the quick-start above starts):
+  measured 2,097,122 against 2,097,106 at the same 2 MiB page. Most deployments sit on the
   1 MiB floor, which is why raising `max_memory` alone usually changes nothing while
   halving the shard count changes it at once: at the default 256 shards it takes an
   8 GiB budget to clear the floor. An entry over the page answers the generic
