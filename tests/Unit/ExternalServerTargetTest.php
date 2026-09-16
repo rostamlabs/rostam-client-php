@@ -66,7 +66,19 @@ class ExternalServerTargetTest extends TestCase
      */
     public static function unusableTargets(): array
     {
-        return [['127.0.0.1'], ['rostam.internal'], [':7411'], ['127.0.0.1:']];
+        return [
+            ['127.0.0.1'],
+            ['rostam.internal'],
+            [':7411'],
+            ['127.0.0.1:'],
+            // Anything beyond a host and a port cannot be honoured, and
+            // dropping it silently would dial somewhere else entirely.
+            ['tcp://127.0.0.1:7411'],
+            ['http://rostam.internal:7411'],
+            ['127.0.0.1:7411/some/path'],
+            ['rostam.internal:7411?replica=2'],
+            ['user:pass@rostam.internal:7411'],
+        ];
     }
 
     #[DataProvider('unusableTargets')]

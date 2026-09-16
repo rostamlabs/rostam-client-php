@@ -141,10 +141,15 @@ final class FakeServer
                 );
             }
 
-            $port = (int) (parse_url('tcp://'.$target, PHP_URL_PORT) ?: 0);
-            $host = (string) (parse_url('tcp://'.$target, PHP_URL_HOST) ?: '');
+            $parts = parse_url('tcp://'.trim($target));
+            $port = (int) ($parts['port'] ?? 0);
+            $host = (string) ($parts['host'] ?? '');
 
-            if ($port === 0 || $host === '') {
+            // Nothing but a host and a port. A path, a query, credentials or a
+            // scheme already on the front are not things this can honour, and
+            // dropping them silently would dial somewhere the caller did not
+            // ask for.
+            if ($port === 0 || $host === '' || array_diff_key($parts ?: [], ['scheme' => 0, 'host' => 0, 'port' => 0]) !== []) {
                 throw new RuntimeException('ROSTAM_TEST_SERVER must look like host:port, got '.$target);
             }
 
