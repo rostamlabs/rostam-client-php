@@ -179,15 +179,28 @@ put is last-writer-wins.
 Two limits, and the second is usually the one you meet.
 
 - **The frame: 16 MiB.** `server.MaxFrameSize` bounds every request body, from
-  v0.5.0 through v0.7.0-beta6. The server does not answer a body over it — it
+  v0.5.0 through v0.7.0-beta7. The server does not answer a body over it — it
   drops the connection — so this client refuses to send one and throws a
   `ProtocolException` with the reason. (Before v0.3.0 it assumed 64 MiB.)
-- **The cache page.** A value has to fit in one page of the server's cache, and the
-  page size follows from `max_memory` divided across the shards. On a default
-  single-node server that is far below the frame limit: the largest value stored
-  was **about 1 MiB** (1,048,544 bytes on v0.6.0, 1,048,540 on v0.7.0-beta6, on the
-  same machine). A value over it answers the generic `internal error`. Fewer
-  shards or a larger `max_memory` raise it.
+- **The cache page**, and it bounds the **key and the value together**. An entry has
+  to fit in one page, and the page follows the PER-SHARD budget:
+  `floorPow2(max_memory / shards / 16)`, clamped to 1 MiB…1 GiB. Measured on
+  v0.7.0-beta7, `strlen($key) + strlen($value)` against that prediction:
+
+  | `max_memory` / shards | page | largest entry |
+  | --- | --- | --- |
+  | default (256 shards) | 1 MiB | **1,048,546** (1,048,550 on v0.6.0) |
+  | 32 MiB / 1 | 2 MiB | 2,097,122 |
+  | 256 MiB / 4 | 4 MiB | 4,194,274 |
+  | 128 MiB / 1 | 8 MiB | 8,388,578 |
+
+  So the limit is the same at every key length — a 60-byte key leaves 60 bytes less
+  for the value — and about 30 bytes under the page. Most deployments sit on the
+  1 MiB floor, which is why raising `max_memory` alone usually changes nothing while
+  halving the shard count changes it at once: at the default 256 shards it takes an
+  8 GiB budget to clear the floor. An entry over the page answers the generic
+  `internal error`; past 16 MiB the frame limit above binds first, and that one is
+  refused here as a `ProtocolException`.
 
 ## Metrics
 
@@ -203,11 +216,18 @@ $metrics->all();             // every unlabelled sample, name => value
 Every number is **node-wide and cumulative since the server started**: it covers
 every key on that node, whoever wrote it.
 
-`evictionsLive()` is the one worth watching. A single-node `rostam-server` always
-evicts at capacity — only replicated shards refuse writes instead, and there is
-no flag or config to change that — and it does so silently: every `put` returns
-success. Measured on v0.7.0-beta6 with a 256 MiB budget, 400 one-megabyte writes
-all succeeded, 235 read back, and `evictionsLive()` said 165.
+`evictionsLive()` is the one worth watching. A single-node `rostam-server` evicts
+rather than refusing a write — only replicated shards refuse, and no flag or config
+changes that — and it does so silently: every `put` returns success. Measured on
+v0.7.0-beta6 with a 256 MiB budget on one shard, 400 writes of 1,000,000 bytes all
+succeeded, 235 read back, and `evictionsLive()` said 165.
+
+Eviction is also write-ordered by default, so a record that merely waits while
+other writes churn past it goes when the buffer wraps — on v0.7.0-beta7 with a
+32 MiB budget, churn of ten times the budget evicted two untouched keys with
+nothing else live. The opt-in flags `-relocating-eviction` (best-effort: it never
+allocates a page, never triggers another eviction and never fails a write) and
+`-sieve-visited-bit` change *what* goes, never *whether*.
 
 The answer is parsed strictly. A line that is not a Prometheus sample, a counter
 that is NaN, infinite, negative or fractional, a repeated series — each is a

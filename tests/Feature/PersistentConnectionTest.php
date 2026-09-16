@@ -44,12 +44,13 @@ class PersistentConnectionTest extends TestCase
 
     private function config(bool $persistent): ConnectionConfig
     {
-        return ConnectionConfig::fromArray([
-            'host' => '127.0.0.1',
-            'port' => $this->server->port,
+        // From the server, not assumed: ROSTAM_TEST_SERVER may name another
+        // machine, and dialling 127.0.0.1 on its port is exactly the mistake
+        // this helper exists to prevent.
+        return ConnectionConfig::fromArray($this->server->connectionConfig([
             'token' => '',
             'persistent' => $persistent,
-        ]);
+        ]));
     }
 
     /**

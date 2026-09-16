@@ -112,25 +112,47 @@ jobs:
           # The HIGHEST version, not the newest by date. Picking by date, a patch
           # published after a beta would hand the pre-release lane a stable
           # server, and every beta-only test would skip without failing. Stable
-          # takes the highest release that is not a pre-release.
-          url=$(php -r '
+          # takes the highest release that is not a pre-release. The picker also
+          # names the asset and the checksums.txt of the SAME release.
+          picked=$(php -r '
             $best = null;
             foreach (json_decode(file_get_contents("releases.json"), true) as $release) {
                 if ($release["draft"] || (getenv("CHANNEL") === "stable" && $release["prerelease"])) {
                     continue;
                 }
-                foreach ($release["assets"] as $asset) {
-                    if (str_ends_with($asset["name"], "linux_amd64.tar.gz")
+                $assets = array_column($release["assets"], "browser_download_url", "name");
+                foreach ($assets as $asset => $download) {
+                    if (str_ends_with($asset, "linux_amd64.tar.gz")
                         && ($best === null || version_compare(ltrim($release["tag_name"], "v"), ltrim($best[0], "v"), ">"))) {
-                        $best = [$release["tag_name"], $asset["browser_download_url"]];
+                        $best = [$release["tag_name"], $download, $asset, $assets["checksums.txt"] ?? ""];
                     }
                 }
             }
             if ($best === null) { fwrite(STDERR, "no linux_amd64 release to test against\n"); exit(1); }
-            echo $best[1];
+            if ($best[3] === "") { fwrite(STDERR, "release {$best[0]} ships no checksums.txt\n"); exit(1); }
+            echo $best[1], " ", $best[2], " ", $best[3];
           ')
-          echo "downloading $url"
+
+          # Split after the substitution, not with it: `set -- $(...)` reports
+          # set's own status, so a picker that exits non-zero would be missed by
+          # `set -e` and surface later as an unbound variable instead.
+          set -- $picked
+          url=$1 name=$2 sums=$3
+
+          echo "downloading $name"
           curl -fsSL "$url" -o rostam.tar.gz
+          curl -fsSL "$sums" -o checksums.txt
+
+          # The one input this job does not get from a pinned source is the
+          # binary it then executes, so it is checked against the checksums the
+          # release publishes beside it.
+          expected=$(awk -v name="$name" '$2 == name || $2 == "*"name {print $1}' checksums.txt)
+          actual=$(sha256sum rostam.tar.gz | cut -d' ' -f1)
+          if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+            echo "::error::checksum mismatch for $name (expected '$expected', got '$actual')"
+            exit 1
+          fi
+
           tar xzf rostam.tar.gz
 
           # "rostam-server 0.7.0-beta6 (go1.26.5 linux/amd64)" -> 0.7.0-beta6.
