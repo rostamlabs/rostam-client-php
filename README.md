@@ -182,12 +182,15 @@ Two limits, and the second is usually the one you meet.
   v0.5.0 through v0.7.0-beta6. The server does not answer a body over it — it
   drops the connection — so this client refuses to send one and throws a
   `ProtocolException` with the reason. (Before v0.3.0 it assumed 64 MiB.)
-- **The cache page.** A value has to fit in one page of the server's cache, and the
-  page size follows from `max_memory` divided across the shards. On a default
-  single-node server that is far below the frame limit: the largest value stored
-  was **about 1 MiB** (1,048,544 bytes on v0.6.0, 1,048,540 on v0.7.0-beta6, on the
-  same machine). A value over it answers the generic `internal error`. Fewer
-  shards or a larger `max_memory` raise it.
+- **The cache page**, and it bounds the **key and the value together**. An entry has
+  to fit in one page of the server's cache, and on a default single-node server that
+  is far below the frame limit: `strlen($key) + strlen($value)` reached **1,048,550
+  bytes on v0.6.0** and **1,048,546 on v0.7.0-beta6 and beta7**, constant across key
+  lengths (measured at 6, 23 and 60 bytes), so a 60-byte key leaves 60 bytes less for
+  the value. It is a constant per deployment rather than a share of `max_memory`: a
+  one-shard server measured **2,097,106** with a 32 MiB budget, and a 512 MiB server
+  still measured 1,048,546 — fewer shards, bigger pages. An entry over it answers the
+  generic `internal error`.
 
 ## Metrics
 
