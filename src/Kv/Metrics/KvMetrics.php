@@ -288,10 +288,26 @@ final class KvMetrics
         }
 
         if (! is_finite($value) || $value < 0 || floor($value) !== $value) {
-            throw new ProtocolException("kv metric {$name} is a counter but reads {$value}");
+            throw new ProtocolException(sprintf('kv metric %s is a counter but reads %s', $name, self::spelled($value)));
         }
 
         return $value >= PHP_INT_MAX ? PHP_INT_MAX : (int) $value;
+    }
+
+    /**
+     * A value as the exposition format spells it. PHP 8.5 warns when NaN is
+     * coerced to a string, and Laravel's error handler turns that warning
+     * into an ErrorException - which would replace the ProtocolException a
+     * caller is waiting for with an error it does not catch.
+     */
+    private static function spelled(float $value): string
+    {
+        return match (true) {
+            is_nan($value) => 'NaN',
+            $value === INF => '+Inf',
+            $value === -INF => '-Inf',
+            default => (string) $value,
+        };
     }
 
     private static function value(string $raw, int $line): int|float

@@ -196,6 +196,7 @@ class KvMetricsTest extends TestCase
         $metrics = KvMetrics::fromPrometheusText(KvMetrics::EVICTIONS_LIVE." {$value}\n");
 
         $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('is a counter but reads '.$value);
 
         $metrics->evictionsLive();
     }
